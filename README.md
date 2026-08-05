@@ -4,7 +4,7 @@ A Discord bot named **Claude**. Two behaviours, nothing else:
 
 | Trigger | Result |
 | --- | --- |
-| A message containing `@Claude` in any channel the bot can see (or any DM) | Claude replies publicly in that channel |
+| A message containing `@Claude`, a reply to one of Claude's messages, or any DM | Claude replies publicly in that channel |
 | `/claude prompt:<question>` | Claude replies **ephemerally** — only the person who ran the command sees the question and the answer |
 
 Claude decides for itself when it needs more than the question. It gets five MCP
@@ -116,6 +116,7 @@ bundles (~277 MB) plus the Node base image.
 
 ```
 src/index.js             Discord client + both handlers
+src/trigger.js           Decides whether a message is addressed to the bot
 src/claude.js            Claude Agent SDK wrapper (concurrency cap, timeout, tool wiring)
 src/discord-tools.js     In-process MCP server exposing the five read tools
 src/chunk.js             Splits answers across Discord's 2000-char limit
@@ -124,8 +125,12 @@ src/register-commands.js One-off /claude registration
 
 ## Notes
 
-- In DMs the bot answers without needing a mention; in servers it only answers when mentioned.
-- Replying to one of the bot's messages does **not** trigger it — mention it explicitly.
+- In servers it answers when mentioned or when you reply to one of its messages;
+  in DMs it answers everything. Replying works whether or not the reply pings it.
+- A reply is a **fresh** request, not a continued session. The message being
+  replied to is named in the prompt, so short follow-ups like "and in feet?"
+  resolve — and Claude can pull more with `fetch_history` if it needs it.
+- Replies between other people never trigger it, and are settled without an API call.
 - Answers longer than 2000 characters are split across multiple messages
   (follow-ups to `/claude` stay ephemeral).
 
@@ -162,6 +167,23 @@ who_is(query, limit?)            name fragment or user ID; servers only
 
 That trailing annotation is what makes attachments reachable — it hands Claude the
 filename and message ID to pass to `read_attachment`.
+
+**How far back it reaches**
+
+Discord history is channel-scoped, not membership-scoped, so the bot can read
+messages posted **long before it joined** — in any channel it can see. Anyone who
+can talk to it can query that whole backlog in plain language, including parts
+they never scrolled to themselves. Bear that in mind before adding it to a
+channel with years of history.
+
+A wide `from` does *not* mean deep history: it returns the newest messages inside
+that window. Reaching old messages means setting `to` as well, which converts to
+a message ID and seeks straight there instead of paging through everything in
+between — so ten-month-old history costs about two API calls, not three hundred.
+Claude works this out on its own, narrowing `to` until it finds what it needs.
+
+Permissions are the real limit: no **View Channel** or **Read Message History**
+means unreachable, full stop.
 
 **Scoping and safety**
 

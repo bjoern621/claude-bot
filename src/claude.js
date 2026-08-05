@@ -32,6 +32,12 @@ const SYSTEM_PROMPT = [
   "read this channel. Say so plainly when something is out of reach.",
 ].join("\n");
 
+/** Short single-line preview of a message, for the context block. */
+function excerpt(text, max = 300) {
+  const flat = (text || "").replace(/\s+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max)}…` : flat;
+}
+
 let active = 0;
 const waiting = [];
 
@@ -56,7 +62,7 @@ function release() {
  * on the channel it was asked in. `channel` scopes that tool — omit it and the
  * tool is not offered at all.
  */
-export async function askClaude(prompt, { channel, botId, author, where } = {}) {
+export async function askClaude(prompt, { channel, botId, author, where, replyingTo } = {}) {
   await acquire();
 
   const discordServer = channel ? createDiscordServer(channel, botId) : null;
@@ -65,6 +71,10 @@ export async function askClaude(prompt, { channel, botId, author, where } = {}) 
     `Current time: ${new Date().toISOString()}`,
     where && `Channel: ${where}`,
     author && `Asked by: ${author}`,
+    // A reply is still a fresh request; this only says what it follows on from.
+    replyingTo &&
+      `This is a reply to your earlier message (id ${replyingTo.id}): ` +
+        `"${excerpt(replyingTo.content)}"`,
   ].filter(Boolean);
 
   const session = query({

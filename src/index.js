@@ -9,6 +9,7 @@ import {
 
 import { askClaude } from "./claude.js";
 import { chunk } from "./chunk.js";
+import { resolveTrigger } from "./trigger.js";
 
 const TOKEN = process.env.DISCORD_TOKEN;
 if (!TOKEN) {
@@ -66,19 +67,10 @@ client.once(Events.ClientReady, (c) => {
   console.log(`Logged in as ${c.user.tag} (${c.user.id})`);
 });
 
-// --- Public: any message that @mentions the bot (and any DM) ---------------
+// --- Public: @mention, a reply to the bot, or any DM ------------------------
 client.on(Events.MessageCreate, async (message) => {
-  if (message.author.bot) return;
-
-  const isDM = message.channel.isDMBased();
-  // Only a direct @Claude counts — not @everyone, not a role the bot happens
-  // to hold, and not the auto-ping from replying to one of its messages.
-  const isMention = message.mentions.has(client.user, {
-    ignoreEveryone: true,
-    ignoreRoles: true,
-    ignoreRepliedUser: true,
-  });
-  if (!isDM && !isMention) return;
+  const { respond, replyTarget } = await resolveTrigger(message, client.user);
+  if (!respond) return;
 
   const prompt = message.content
     .replaceAll(`<@${client.user.id}>`, "")
@@ -97,6 +89,7 @@ client.on(Events.MessageCreate, async (message) => {
         botId: client.user.id,
         author: message.author.displayName || message.author.username,
         where: describeChannel(message.channel),
+        replyingTo: replyTarget,
       }),
     );
     const parts = chunk(answer);
