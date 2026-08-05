@@ -1,0 +1,8 @@
+services:
+  bot:
+    build: .
+    image: claude-bot
+    container_name: claude-bot
+    restart: unless-stopped
+    env_file: .env
+    init: true

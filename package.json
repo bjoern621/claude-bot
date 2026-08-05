@@ -1,0 +1,31 @@
+{
+  "name": "claude-bot",
+  "version": "1.0.0",
+  "description": "Discord bot named Claude: replies to @mentions, plus a private /claude command.",
+  "main": "src/index.js",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "register": "node src/register-commands.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bjoern621/claude-bot.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/bjoern621/claude-bot/issues"
+  },
+  "homepage": "https://github.com/bjoern621/claude-bot#readme",
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.222",
+    "discord.js": "^14.27.0",
+    "dotenv": "^17.4.2"
+  }
+}
