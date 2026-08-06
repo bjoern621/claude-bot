@@ -84,10 +84,6 @@ export const instruments = {
     // question in the top bucket.
     advice: { explicitBucketBoundaries: [0.5, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 120] },
   }),
-  tokensRemaining: meter.createGauge("claude_bot.user.tokens_remaining", {
-    description: "Tokens left in a user's bucket immediately after a decision.",
-    unit: "{token}",
-  }),
   toolCalls: meter.createCounter("claude_bot.tool.calls", {
     description: "Discord tool invocations by the model.",
     unit: "{call}",

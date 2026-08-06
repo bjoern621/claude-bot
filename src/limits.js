@@ -23,7 +23,7 @@
  * restarting often enough to matter has a worse problem than a forgiven hour.
  */
 
-import { event, instruments, observe } from "./telemetry.js";
+import { event, observe } from "./telemetry.js";
 
 const HOUR_MS = 3_600_000;
 const DAY_MS = 24 * HOUR_MS;
@@ -187,7 +187,10 @@ export function claim(userId, where = {}) {
     if (bucket.tokens < 1) {
       // Time for the fraction of a token still missing, not for a whole one.
       const wait = ((1 - bucket.tokens) * HOUR_MS) / PER_USER_HOUR;
-      instruments.tokensRemaining.record(rounded(bucket.tokens), { user_id: userId });
+      // Stored even though nothing was spent: the refusal is what puts a user on
+      // the bucket gauge, and without it a refused user has no series until they
+      // land a question.
+      userBuckets.set(userId, bucket);
       return refuse(
         "user_bucket",
         wait,
@@ -197,16 +200,27 @@ export function claim(userId, where = {}) {
 
     bucket.tokens -= 1;
     userBuckets.set(userId, bucket);
-    instruments.tokensRemaining.record(rounded(bucket.tokens), { user_id: userId });
   }
 
   globalHits.push(now);
   return null;
 }
 
-// The windows are read at export time rather than pushed on change: a bucket
-// refills with the clock, so a value recorded only when someone asks would
-// flatline for as long as nobody does.
+// Every gauge below is read at export time rather than written when someone
+// asks. Both a bucket and a sliding window move with the clock alone, so a value
+// recorded only on a question would hold its last reading for as long as nobody
+// asks and show a refill as a step at the next question instead of the slope it
+// actually is.
+//
+// A user appears here from their first question onward. `bucketFor` only reads,
+// so observing costs nothing and cannot refill anyone by being watched.
+observe("claude_bot.user.tokens_remaining", "Tokens left in a user's bucket.", (result) => {
+  const now = Date.now();
+  for (const id of userBuckets.keys()) {
+    result.observe(rounded(bucketFor(id, now).tokens), { user_id: id });
+  }
+});
+
 observe("claude_bot.global.budget_used", "Questions inside the global window.", (result) => {
   const now = Date.now();
   prune(globalHits, DAY_MS, now);

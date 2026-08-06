@@ -1,6 +1,6 @@
 {
   "name": "claude-bot",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Discord bot named Claude: replies to @mentions, plus a private /claude command.",
   "main": "src/index.js",
   "type": "module",
