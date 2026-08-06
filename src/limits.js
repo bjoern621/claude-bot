@@ -7,9 +7,16 @@
  * than refusing it. These limits refuse the request outright, before any of it
  * reaches Claude.
  *
- * Three windows, all enforced together. The per-user hour keeps one person from
- * eating the budget; the global hour bounds a burst from a whole channel; the
- * global day is the backstop that a slow drip cannot walk past.
+ * Two different shapes, because the two jobs differ.
+ *
+ * The global hour and day are sliding windows: they guard real spend, so they
+ * want a hard ceiling on any 60-minute stretch and no burst allowance at all.
+ *
+ * The per-user limit is a token bucket. A hard hourly cap locks someone out for
+ * a full hour after a normal back-and-forth, which reads as broken; a bucket
+ * hands a question back every few minutes instead. Note the cost of that: a
+ * bucket admits up to `burst + rate` in one hour, not `rate`, so the burst size
+ * is deliberately smaller than the hourly rate rather than equal to it.
  *
  * State is in-process, so a restart forgives every window. That is the accepted
  * cost of keeping the bot stateless: the limits bound a spending rate, and a bot
@@ -36,7 +43,9 @@ function limit(name, fallback) {
   return value;
 }
 
+/** Tokens added per hour, and the most a bucket can hold. */
 const PER_USER_HOUR = limit("RATE_LIMIT_USER_PER_HOUR", 10);
+const PER_USER_BURST = Math.min(limit("RATE_LIMIT_USER_BURST", 5), PER_USER_HOUR);
 const GLOBAL_HOUR = limit("RATE_LIMIT_GLOBAL_PER_HOUR", 40);
 const GLOBAL_DAY = limit("RATE_LIMIT_GLOBAL_PER_DAY", 200);
 
@@ -50,8 +59,8 @@ const EXEMPT = new Set(
 
 /** Accepted-question timestamps, oldest first, pruned to the global day. */
 const globalHits = [];
-/** Per-user accepted-question timestamps, oldest first, pruned to the hour. */
-const userHits = new Map();
+/** Per-user token buckets: `{ tokens, at }`, refilled lazily on read. */
+const userBuckets = new Map();
 /** Per-user timestamp of the last refusal the user was actually told about. */
 const lastNotice = new Map();
 
@@ -89,13 +98,29 @@ function inWords(ms) {
   return hours === 1 ? "in about an hour" : `in about ${hours} hours`;
 }
 
+/**
+ * A user's bucket, refilled for the time since it was last touched. A bucket
+ * that has refilled to capacity is indistinguishable from a new one, which is
+ * what makes eviction in `sweep` safe.
+ */
+function bucketFor(userId, now) {
+  const held = userBuckets.get(userId);
+  if (!held) return { tokens: PER_USER_BURST, at: now };
+
+  const gained = ((now - held.at) * PER_USER_HOUR) / HOUR_MS;
+  return { tokens: Math.min(PER_USER_BURST, held.tokens + gained), at: now };
+}
+
+/**
+ * Both maps are checked, not just one. A user refused by a *global* limit never
+ * gets a bucket, so gating the sweep on bucket count alone let `lastNotice`
+ * grow without bound during exactly the flood it exists to quieten.
+ */
 function sweep(now) {
-  if (userHits.size <= SWEEP_AT) return;
-  for (const [id, hits] of userHits) {
-    if (prune(hits, HOUR_MS, now).length === 0) {
-      userHits.delete(id);
-      lastNotice.delete(id);
-    }
+  if (userBuckets.size <= SWEEP_AT && lastNotice.size <= SWEEP_AT) return;
+
+  for (const id of userBuckets.keys()) {
+    if (bucketFor(id, now).tokens >= PER_USER_BURST) userBuckets.delete(id);
   }
   for (const [id, at] of lastNotice) {
     if (at + NOTICE_COOLDOWN_MS <= now) lastNotice.delete(id);
@@ -126,14 +151,20 @@ export function claim(userId) {
     return `I am answering as fast as my hourly budget allows. Try again ${inWords(wait)}.`;
   }
 
-  const hits = prune(userHits.get(userId) ?? [], HOUR_MS, now);
-  if (hits.length >= PER_USER_HOUR) {
-    const wait = retryIn(hits, PER_USER_HOUR, HOUR_MS, now);
-    return `That is your ${PER_USER_HOUR} questions for the hour. Try again ${inWords(wait)}.`;
+  // "off" means no per-user bucket at all — refilling one at an infinite rate
+  // would work out the same, but only by accident.
+  if (PER_USER_HOUR !== Infinity) {
+    const bucket = bucketFor(userId, now);
+    if (bucket.tokens < 1) {
+      // Time for the fraction of a token still missing, not for a whole one.
+      const wait = ((1 - bucket.tokens) * HOUR_MS) / PER_USER_HOUR;
+      return `You are asking faster than I can keep up. Try again ${inWords(wait)}.`;
+    }
+
+    bucket.tokens -= 1;
+    userBuckets.set(userId, bucket);
   }
 
-  hits.push(now);
-  userHits.set(userId, hits);
   globalHits.push(now);
   return null;
 }

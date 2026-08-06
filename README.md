@@ -114,7 +114,8 @@ bundles (~277 MB) plus the Node base image.
 | `RECENT_MESSAGES` | no | `5` | Recent messages sent with every question; `0` disables |
 | `WEB_TOOLS` | no | on | Set to `off` to remove web search and page fetch |
 | `CLAUDE_MAX_QUEUE` | no | `8` | Questions allowed to wait for a slot before the bot says it is busy |
-| `RATE_LIMIT_USER_PER_HOUR` | no | `10` | One person's questions per hour; `off` disables |
+| `RATE_LIMIT_USER_BURST` | no | `5` | One person's questions back-to-back; capped to the rate below |
+| `RATE_LIMIT_USER_PER_HOUR` | no | `10` | Rate those refill at, one every 6 min; `off` disables |
 | `RATE_LIMIT_GLOBAL_PER_HOUR` | no | `40` | Questions per hour across everyone; `off` disables |
 | `RATE_LIMIT_GLOBAL_PER_DAY` | no | `200` | Questions per day across everyone; `off` disables |
 | `RATE_LIMIT_EXEMPT_IDS` | no | — | Comma-separated user IDs that skip every rate limit |
@@ -156,16 +157,29 @@ src/register-commands.js One-off /claude registration
 ### Spend limits
 
 Anyone who can see the bot can spend its subscription quota, so a question is
-charged against three windows before any work starts: the asker's hour, everyone's
-hour, and everyone's day. Over any one of them the question is refused rather than
-queued, because queueing delays the same spend instead of preventing it. Nothing is
-charged for a refusal, so hammering the bot cannot push the asker's own window
-further out. A refused person is told once a minute and answered with silence in
-between, so the refusals do not become the flood.
+charged before any work starts. Over a limit it is refused rather than queued,
+because queueing delays the same spend instead of preventing it. Nothing is charged
+for a refusal, so hammering the bot cannot push the asker's own limit further out.
+A refused person is told once a minute and answered with silence in between, so the
+refusals do not become the flood.
 
-The windows live in memory and reset when the pod restarts. Bounding a spending
-*rate* is what they are for; a bot restarting often enough for that to matter has a
-worse problem.
+**Globally** two sliding windows guard real spend — everyone's hour and everyone's
+day. These want a hard ceiling on any 60-minute stretch, with no burst allowance.
+
+**Per user** it is a token bucket instead. A hard hourly cap locks someone out for a
+full hour after a normal back-and-forth, which reads as broken; a bucket hands a
+question back every few minutes. At the defaults: five available at once, one more
+every six minutes.
+
+The cost of that is worth stating. A bucket admits `burst + rate` in one hour, not
+`rate` — measured over three hours of continuous asking, the defaults let 14 through
+in the worst 60-minute window against 10 for a strict hourly cap. That is why the
+burst is deliberately smaller than the rate rather than equal to it. Set
+`RATE_LIMIT_USER_BURST=3` to tighten it toward 12.
+
+State lives in memory and resets when the pod restarts. Bounding a spending *rate* is
+what these are for; a bot restarting often enough for that to matter has a worse
+problem.
 
 `RATE_LIMIT_EXEMPT_IDS` carries the owner's user ID past all three.
 
