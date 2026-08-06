@@ -23,6 +23,8 @@
  * restarting often enough to matter has a worse problem than a forgiven hour.
  */
 
+import { event, instruments, observe } from "./telemetry.js";
+
 const HOUR_MS = 3_600_000;
 const DAY_MS = 24 * HOUR_MS;
 
@@ -127,28 +129,55 @@ function sweep(now) {
   }
 }
 
+/** Two decimals is all a dashboard can show, and it keeps the gauge steady. */
+function rounded(tokens) {
+  return Math.round(tokens * 100) / 100;
+}
+
 /**
  * Charge one question to `userId`.
  *
  * Returns null when the question may proceed, and consumes budget in that case
- * only. Returns the sentence to show the user when it may not; nothing is
- * consumed by a refusal, so a spammer cannot push their own window further out.
+ * only. Returns `{ reason, message }` when it may not: `message` is the sentence
+ * to show the user, `reason` the label the caller records. Nothing is consumed
+ * by a refusal, so a spammer cannot push their own window further out.
+ *
+ * `where` carries the guild and channel through to the emitted event. They are
+ * not needed to decide anything; they are what makes the decision searchable
+ * afterwards.
  */
-export function claim(userId) {
+export function claim(userId, where = {}) {
   if (EXEMPT.has(userId)) return null;
 
   const now = Date.now();
   prune(globalHits, DAY_MS, now);
   sweep(now);
 
+  const refuse = (reason, wait, message) => {
+    event(
+      `Refused a question: ${reason}`,
+      { ...where, user_id: userId, limit_reason: reason, retry_after_ms: wait },
+      "WARN",
+    );
+    return { reason, message };
+  };
+
   if (countWithin(globalHits, DAY_MS, now) >= GLOBAL_DAY) {
     const wait = retryIn(globalHits, GLOBAL_DAY, DAY_MS, now);
-    return `I have used up my question budget for today. Try again ${inWords(wait)}.`;
+    return refuse(
+      "global_day",
+      wait,
+      `I have used up my question budget for today. Try again ${inWords(wait)}.`,
+    );
   }
   if (countWithin(globalHits, HOUR_MS, now) >= GLOBAL_HOUR) {
     const hourly = globalHits.slice(-GLOBAL_HOUR);
     const wait = retryIn(hourly, GLOBAL_HOUR, HOUR_MS, now);
-    return `I am answering as fast as my hourly budget allows. Try again ${inWords(wait)}.`;
+    return refuse(
+      "global_hour",
+      wait,
+      `I am answering as fast as my hourly budget allows. Try again ${inWords(wait)}.`,
+    );
   }
 
   // "off" means no per-user bucket at all — refilling one at an infinite rate
@@ -158,16 +187,40 @@ export function claim(userId) {
     if (bucket.tokens < 1) {
       // Time for the fraction of a token still missing, not for a whole one.
       const wait = ((1 - bucket.tokens) * HOUR_MS) / PER_USER_HOUR;
-      return `You are asking faster than I can keep up. Try again ${inWords(wait)}.`;
+      instruments.tokensRemaining.record(rounded(bucket.tokens), { user_id: userId });
+      return refuse(
+        "user_bucket",
+        wait,
+        `You are asking faster than I can keep up. Try again ${inWords(wait)}.`,
+      );
     }
 
     bucket.tokens -= 1;
     userBuckets.set(userId, bucket);
+    instruments.tokensRemaining.record(rounded(bucket.tokens), { user_id: userId });
   }
 
   globalHits.push(now);
   return null;
 }
+
+// The windows are read at export time rather than pushed on change: a bucket
+// refills with the clock, so a value recorded only when someone asks would
+// flatline for as long as nobody does.
+observe("claude_bot.global.budget_used", "Questions inside the global window.", (result) => {
+  const now = Date.now();
+  prune(globalHits, DAY_MS, now);
+  result.observe(countWithin(globalHits, HOUR_MS, now), { window: "hour" });
+  result.observe(countWithin(globalHits, DAY_MS, now), { window: "day" });
+});
+
+// Published so a dashboard reads the headroom off the same source as the bot,
+// instead of hardcoding a ceiling that a ConfigMap edit would falsify. A window
+// switched off has no ceiling to report.
+observe("claude_bot.global.budget_limit", "Ceiling on the global window.", (result) => {
+  if (GLOBAL_HOUR !== Infinity) result.observe(GLOBAL_HOUR, { window: "hour" });
+  if (GLOBAL_DAY !== Infinity) result.observe(GLOBAL_DAY, { window: "day" });
+});
 
 /**
  * Whether a refusal should be spoken aloud in a channel.

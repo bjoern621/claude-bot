@@ -1,8 +1,10 @@
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
+import { context as otelContext, SpanStatusCode } from "@opentelemetry/api";
 import { SnowflakeUtil } from "discord.js";
 import { z } from "zod";
 
 import { assertInChannel, isPermittedChannel } from "./channels.js";
+import { instruments, tracer } from "./telemetry.js";
 
 const SERVER = "discord";
 const names = [
@@ -37,6 +39,9 @@ export function createDiscordServer(channel, botId) {
     throw new Error(`Channel ${channel.id} is a DM or outside ALLOWED_CHANNEL_IDS.`);
   }
 
+  // Captured while the question's span is still active. See `traced`.
+  const parent = otelContext.active();
+
   return createSdkMcpServer({
     name: SERVER,
     version: "1.0.0",
@@ -64,7 +69,7 @@ export function createDiscordServer(channel, botId) {
               `Maximum messages to return, newest kept first. Default ${DEFAULT_LIMIT}, cap ${MAX_LIMIT}.`,
             ),
         },
-        wrap((args) => fetchTranscript(channel, botId, args)),
+        traced(parent, "fetch_history", wrap((args) => fetchTranscript(channel, botId, args))),
       ),
 
       tool(
@@ -87,7 +92,7 @@ export function createDiscordServer(channel, botId) {
             .optional()
             .describe("How many messages to include either side of it. Default 0."),
         },
-        wrap((args) => fetchMessage(channel, botId, args)),
+        traced(parent, "fetch_message", wrap((args) => fetchMessage(channel, botId, args))),
       ),
 
       tool(
@@ -103,13 +108,13 @@ export function createDiscordServer(channel, botId) {
             .optional()
             .describe("Which attachment, when the message has several. Defaults to the first."),
         },
-        async (args) => {
+        traced(parent, "read_attachment", async (args) => {
           try {
             return await readAttachment(channel, args);
           } catch (error) {
             return errorResult(error);
           }
-        },
+        }),
       ),
 
       tool(
@@ -126,7 +131,7 @@ export function createDiscordServer(channel, botId) {
             .optional()
             .describe("Maximum pins to return, newest first. Default 20."),
         },
-        wrap((args) => getPinned(channel, botId, args)),
+        traced(parent, "get_pinned_messages", wrap((args) => getPinned(channel, botId, args))),
       ),
 
       tool(
@@ -144,7 +149,7 @@ export function createDiscordServer(channel, botId) {
             .optional()
             .describe("Maximum matches to return. Default 5."),
         },
-        wrap((args) => whoIs(channel, args)),
+        traced(parent, "who_is", wrap((args) => whoIs(channel, args))),
       ),
     ],
   });
@@ -505,6 +510,42 @@ function iso(ms) {
 
 function size(bytes) {
   return bytes < 1024 ? `${bytes} bytes` : `${Math.round(bytes / 1024)} KiB`;
+}
+
+/**
+ * Span and counters around one tool call.
+ *
+ * `parent` is captured by the caller instead of read here. The Agent SDK invokes
+ * these handlers from its own event-loop turn, where no context is active, so a
+ * span started here would otherwise become a root of its own and the trace would
+ * not show which question caused the call.
+ *
+ * `wrap` turns a failure into an error result rather than an exception, so the
+ * outcome is read off the result, not off a catch.
+ */
+function traced(parent, name, handler) {
+  return (args) =>
+    otelContext.with(parent, () =>
+      tracer.startActiveSpan(`discord.${name}`, async (span) => {
+        const startedAt = Date.now();
+        try {
+          const result = await handler(args);
+          const outcome = result?.isError ? "error" : "ok";
+          span.setAttribute("tool.outcome", outcome);
+          if (result?.isError) span.setStatus({ code: SpanStatusCode.ERROR });
+          instruments.toolCalls.add(1, { tool: name, outcome });
+          return result;
+        } catch (error) {
+          span.recordException(error);
+          span.setStatus({ code: SpanStatusCode.ERROR, message: error.message });
+          instruments.toolCalls.add(1, { tool: name, outcome: "error" });
+          throw error;
+        } finally {
+          instruments.toolDuration.record((Date.now() - startedAt) / 1000, { tool: name });
+          span.end();
+        }
+      }),
+    );
 }
 
 /** Tool bodies return plain strings; failures come back as readable tool errors. */

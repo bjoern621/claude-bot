@@ -1,3 +1,7 @@
+// First import on purpose: the OpenTelemetry SDK has to be running before any
+// module that records to it is evaluated, and ESM evaluates in import order.
+import { event, instruments, shutdownTelemetry, tracer } from "./telemetry.js";
+
 import "dotenv/config";
 import { Client, Events, GatewayIntentBits, MessageFlags } from "discord.js";
 
@@ -44,6 +48,12 @@ function userFacing(error) {
     : "Something went wrong — the details are in the bot's logs.";
 }
 
+/** The label a failure is counted under. Distinct causes, distinct fixes. */
+function outcomeOf(error) {
+  if (/^busy:/.test(error.message)) return "refused_queue";
+  return /did not respond within/.test(error.message) ? "timeout" : "error";
+}
+
 /** Human-readable channel label for the prompt context block. */
 function describeChannel(channel) {
   if (channel.isDMBased()) return "a direct message";
@@ -63,11 +73,59 @@ async function withTyping(channel, work) {
   }
 }
 
+/**
+ * One question from admission to answer, with the telemetry around it.
+ *
+ * Both entry points run through here so a mention and a slash command produce
+ * the same counter, told apart by `surface` rather than by which code path
+ * happened to record them. The caller keeps what differs: how a refusal is
+ * delivered, and how an answer is posted.
+ *
+ * Every question lands on `claude_bot.questions` exactly once, whatever the
+ * outcome, so admitted plus refused is the total asked.
+ */
+async function answerQuestion({ surface, user, channel, guildId, ask, post, refuse }) {
+  const where = {
+    surface,
+    guild_id: guildId ?? "none",
+    channel_id: channel?.id ?? "none",
+  };
+  const labels = { ...where, user_id: user.id };
+
+  const refusal = claim(user.id, where);
+  if (refusal) {
+    instruments.questions.add(1, { ...labels, outcome: `refused_${refusal.reason}` });
+    await refuse(refusal);
+    return;
+  }
+
+  const startedAt = Date.now();
+  await tracer.startActiveSpan("question", async (span) => {
+    span.setAttributes(labels);
+    let outcome = "answered";
+    try {
+      await post(await ask());
+    } catch (error) {
+      outcome = outcomeOf(error);
+      console.error(`${surface} handler failed:`, error);
+      span.recordException(error);
+      await refuse({ reason: outcome, message: userFacing(error) });
+    } finally {
+      const seconds = (Date.now() - startedAt) / 1000;
+      instruments.duration.record(seconds, { outcome });
+      instruments.questions.add(1, { ...labels, outcome });
+      span.setAttribute("outcome", outcome);
+      span.end();
+      event(`Question ${outcome}`, { ...labels, outcome, duration_s: seconds });
+    }
+  });
+}
+
 client.once(Events.ClientReady, (c) => {
   console.log(`Logged in as ${c.user.tag} (${c.user.id})`);
 });
 
-// --- Public: @mention, a reply to the bot, or any DM ------------------------
+// --- Public: an @mention or a reply to the bot ------------------------------
 client.on(Events.MessageCreate, async (message) => {
   const { respond, replyTarget } = await resolveTrigger(message, client.user);
   if (!respond) return;
@@ -82,35 +140,39 @@ client.on(Events.MessageCreate, async (message) => {
     return;
   }
 
-  // Charged before any work starts, so a flood costs Discord API calls and
-  // nothing else. A refused user is told once, then answered with silence.
-  const refusal = claim(message.author.id);
-  if (refusal) {
-    if (shouldAnnounce(message.author.id)) await message.reply(refusal).catch(() => {});
-    return;
-  }
-
-  try {
-    const answer = await withTyping(message.channel, () =>
-      askClaude(prompt, {
-        channel: message.channel,
-        botId: client.user.id,
-        author: message.author.displayName || message.author.username,
-        where: describeChannel(message.channel),
-        replyingTo: replyTarget,
-        // Seed from what came before this message — it is the question itself.
-        recentBefore: message.id,
-      }),
-    );
-    const parts = chunk(answer);
-    await message.reply(parts[0]);
-    for (const part of parts.slice(1)) {
-      await message.channel.send(part);
-    }
-  } catch (error) {
-    console.error("mention handler failed:", error);
-    await message.reply(userFacing(error)).catch(() => {});
-  }
+  await answerQuestion({
+    surface: "mention",
+    user: message.author,
+    channel: message.channel,
+    guildId: message.guildId,
+    ask: () =>
+      withTyping(message.channel, () =>
+        askClaude(prompt, {
+          channel: message.channel,
+          botId: client.user.id,
+          author: message.author.displayName || message.author.username,
+          where: describeChannel(message.channel),
+          replyingTo: replyTarget,
+          // Seed from what came before this message — it is the question itself.
+          recentBefore: message.id,
+        }),
+      ),
+    post: async (answer) => {
+      const parts = chunk(answer);
+      await message.reply(parts[0]);
+      for (const part of parts.slice(1)) {
+        await message.channel.send(part);
+      }
+    },
+    // A refused flood answered one refusal per message would be the same flood
+    // with the bot's name on it, so rate-limit refusals are spoken once a minute.
+    // A failure is not a flood and is always reported.
+    refuse: async ({ reason, message: text }) => {
+      const quiet = reason.startsWith("global") || reason === "user_bucket";
+      if (quiet && !shouldAnnounce(message.author.id)) return;
+      await message.reply(text).catch(() => {});
+    },
+  });
 });
 
 // --- Private: /claude ------------------------------------------------------
@@ -130,38 +192,43 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
-  // The refusal is ephemeral like the rest of the command, so it is not channel
-  // noise and there is no reason to withhold it after the first one.
-  const refusal = claim(interaction.user.id);
-  if (refusal) {
-    await interaction.editReply(refusal).catch(() => {});
-    return;
-  }
-
-  try {
+  await answerQuestion({
+    surface: "slash",
+    user: interaction.user,
+    channel: interaction.channel,
+    guildId: interaction.guildId,
     // The channel is already visible to whoever ran the command, so letting
     // Claude read it leaks nothing — only the question and answer stay private.
-    const answer = await askClaude(prompt, {
-      channel: interaction.channel ?? undefined,
-      botId: client.user.id,
-      author: interaction.user.displayName || interaction.user.username,
-      where: interaction.channel ? describeChannel(interaction.channel) : undefined,
-    });
-    const parts = chunk(answer);
-    await interaction.editReply(parts[0]);
-    for (const part of parts.slice(1)) {
-      await interaction.followUp({ content: part, flags: MessageFlags.Ephemeral });
-    }
-  } catch (error) {
-    console.error("/claude failed:", error);
-    await interaction.editReply(userFacing(error)).catch(() => {});
-  }
+    ask: () =>
+      askClaude(prompt, {
+        channel: interaction.channel ?? undefined,
+        botId: client.user.id,
+        author: interaction.user.displayName || interaction.user.username,
+        where: interaction.channel ? describeChannel(interaction.channel) : undefined,
+      }),
+    post: async (answer) => {
+      const parts = chunk(answer);
+      await interaction.editReply(parts[0]);
+      for (const part of parts.slice(1)) {
+        await interaction.followUp({ content: part, flags: MessageFlags.Ephemeral });
+      }
+    },
+    // Ephemeral like the rest of the command, so it is not channel noise and
+    // there is no reason to withhold it after the first one.
+    refuse: async ({ message: text }) => {
+      await interaction.editReply(text).catch(() => {});
+    },
+  });
 });
 
 for (const signal of ["SIGINT", "SIGTERM"]) {
   process.on(signal, () => {
     console.log(`${signal} received, shutting down.`);
-    client.destroy().finally(() => process.exit(0));
+    // Telemetry first: the queued spans and the last metric interval are lost
+    // if the process exits before the exporters flush.
+    shutdownTelemetry()
+      .then(() => client.destroy())
+      .finally(() => process.exit(0));
   });
 }
 

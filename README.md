@@ -119,6 +119,9 @@ bundles (~277 MB) plus the Node base image.
 | `RATE_LIMIT_GLOBAL_PER_HOUR` | no | `40` | Questions per hour across everyone; `off` disables |
 | `RATE_LIMIT_GLOBAL_PER_DAY` | no | `200` | Questions per day across everyone; `off` disables |
 | `RATE_LIMIT_EXEMPT_IDS` | no | — | Comma-separated user IDs that skip every rate limit |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | no | — | OTLP/HTTP collector. Unset, telemetry is off |
+| `OTEL_SERVICE_NAME` | no | `claude-bot` | Service name on every exported signal |
+| `OTEL_METRIC_EXPORT_INTERVAL` | no | `15000` | Milliseconds between metric exports |
 | `ALLOWED_CHANNEL_IDS` | no | — | Comma-separated channel IDs the bot may use; empty means every server channel |
 | `HISTORY_DEFAULT_LIMIT` | no | `50` | Messages returned when Claude names no limit |
 | `HISTORY_MAX_LIMIT` | no | `200` | Hard cap per call, whatever Claude asks for |
@@ -136,6 +139,7 @@ src/index.js             Discord client + both handlers
 src/trigger.js           Decides whether a message is addressed to the bot
 src/claude.js            Claude Agent SDK wrapper (concurrency cap, timeout, tool wiring)
 src/limits.js            Per-user and global rate limits, charged before any work starts
+src/telemetry.js         OpenTelemetry setup and the instruments the rest records to
 src/channels.js          Channel allowlist and the same-channel assertion
 src/discord-tools.js     In-process MCP server exposing the five read tools
 src/chunk.js             Splits answers across Discord's 2000-char limit
@@ -222,6 +226,41 @@ Layer 1 alone is sufficient; the rest hold if it is ever changed back.
 
 `who_is` is the one tool that is server-scoped rather than channel-scoped — it
 looks up members, not messages. It reads no message content.
+
+### Telemetry
+
+With `OTEL_EXPORTER_OTLP_ENDPOINT` set, every question produces all three
+signals, split by what each is good at.
+
+**Metrics** carry the shapes worth graphing: `claude_bot_questions_total`
+(`outcome`, `surface`, `user_id`, `guild_id`), `claude_bot_question_duration_seconds`,
+`claude_bot_user_tokens_remaining` per user, `claude_bot_global_budget_used` against
+`claude_bot_global_budget_limit`, `claude_bot_inflight`, `claude_bot_queue_depth`,
+`claude_bot_tool_calls_total`, and the model's own `claude_bot_claude_tokens_total`
+and `claude_bot_claude_turns`. The names above are the Prometheus ones; the
+instruments are declared in OTel form (`claude_bot.questions`) and the collector
+rewrites dots and appends `_total` and `_seconds`.
+
+Every question increments `claude_bot_questions_total` exactly once, refusals
+included, so admitted plus refused is the total asked.
+
+`user_id` sits on the counters but not the histograms, where it would multiply by
+bucket count. It is bounded by the size of one server; on a bot open to many
+servers it would not be.
+
+**Events** go to the log pipeline, one per decision, carrying what is too
+high-cardinality to label a metric with: the user, the exact refusal, how long it
+has left to run. Each is stamped `app=claude-bot`.
+
+**Traces** give one `question` span per question, with `claude.query` beneath it
+and a span per Discord tool call. The tool spans are the reason a slow answer is
+readable: they separate the model thinking from five history fetches.
+
+Attribute keys are underscored (`user_id`, not `user.id`) so the same name works
+in both PromQL and LogsQL.
+
+Nothing is auto-instrumented. HTTP client spans would be dominated by the typing
+indicator the bot refreshes every eight seconds per in-flight question.
 
 ### The tools
 

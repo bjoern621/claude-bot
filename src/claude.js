@@ -1,7 +1,9 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
+import { SpanStatusCode } from "@opentelemetry/api";
 
 import { isPermittedChannel } from "./channels.js";
 import { TOOL_NAMES, createDiscordServer, recentTranscript } from "./discord-tools.js";
+import { instruments, observe, tracer } from "./telemetry.js";
 
 const MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-5";
 const TIMEOUT_MS = Number(process.env.CLAUDE_TIMEOUT_MS || 120_000);
@@ -84,6 +86,39 @@ function release() {
   else active--;
 }
 
+observe("claude_bot.inflight", "Questions being answered right now.", (r) => r.observe(active));
+observe("claude_bot.queue_depth", "Questions waiting for a slot.", (r) => r.observe(waiting.length));
+
+/**
+ * Copy what the Agent SDK reports about a finished question onto the span and
+ * the counters. `total_cost_usd` is zero under subscription auth, so the token
+ * counters are the load signal there and cost is only meaningful on an API key.
+ */
+function recordResult(span, message) {
+  const turns = Number(message.num_turns);
+  if (Number.isFinite(turns)) {
+    instruments.turns.record(turns);
+    span.setAttribute("claude.turns", turns);
+  }
+
+  const cost = Number(message.total_cost_usd);
+  if (Number.isFinite(cost) && cost > 0) {
+    instruments.cost.add(cost);
+    span.setAttribute("claude.cost_usd", cost);
+  }
+
+  const usage = message.usage || {};
+  for (const [field, kind] of [
+    ["input_tokens", "input"],
+    ["output_tokens", "output"],
+    ["cache_read_input_tokens", "cache_read"],
+    ["cache_creation_input_tokens", "cache_write"],
+  ]) {
+    const count = Number(usage[field]);
+    if (Number.isFinite(count) && count > 0) instruments.claudeTokens.add(count, { kind });
+  }
+}
+
 /**
  * Send one prompt to Claude and return the plain-text answer.
  *
@@ -95,7 +130,27 @@ export async function askClaude(
   prompt,
   { channel, botId, author, where, replyingTo, recentBefore } = {},
 ) {
+  // Timed separately from the query. A slow answer and a queued one look
+  // identical to the person waiting, and only one of them is the model's fault.
+  const queuedAt = Date.now();
   await acquire();
+  const queueWaitMs = Date.now() - queuedAt;
+
+  // Everything below runs inside the span so the Discord tools, which the SDK
+  // invokes from its own event-loop turn, have a parent to attach to.
+  return tracer.startActiveSpan("claude.query", (span) =>
+    runQuery(span, queueWaitMs, prompt, { channel, botId, author, where, replyingTo, recentBefore }),
+  );
+}
+
+async function runQuery(
+  span,
+  queueWaitMs,
+  prompt,
+  { channel, botId, author, where, replyingTo, recentBefore },
+) {
+  span.setAttribute("claude.model", MODEL);
+  span.setAttribute("queue.wait_ms", queueWaitMs);
 
   // Third gate, after the trigger and the slash-command handler. A channel that
   // slips past both gets no Discord tools and no seeded messages at all, rather
@@ -150,6 +205,7 @@ export async function askClaude(
   try {
     for await (const message of session) {
       if (message.type !== "result") continue;
+      recordResult(span, message);
 
       if (message.subtype === "success" && !message.is_error) {
         const text = (message.result || "").trim();
@@ -165,9 +221,14 @@ export async function askClaude(
 
     // Stream ended without a result message — usually the timeout closing it.
     throw new Error(`Claude did not respond within ${TIMEOUT_MS} ms`);
+  } catch (error) {
+    span.recordException(error);
+    span.setStatus({ code: SpanStatusCode.ERROR, message: error.message });
+    throw error;
   } finally {
     clearTimeout(timer);
     session.close();
     release();
+    span.end();
   }
 }
