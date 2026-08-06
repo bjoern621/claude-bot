@@ -90,6 +90,8 @@ client.on(Events.MessageCreate, async (message) => {
         author: message.author.displayName || message.author.username,
         where: describeChannel(message.channel),
         replyingTo: replyTarget,
+        // Seed from what came before this message — it is the question itself.
+        recentBefore: message.id,
       }),
     );
     const parts = chunk(answer);

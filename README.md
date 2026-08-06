@@ -7,14 +7,17 @@ A Discord bot named **Claude**. Two behaviours, nothing else:
 | A message containing `@Claude`, a reply to one of Claude's messages, or any DM | Claude replies publicly in that channel |
 | `/claude prompt:<question>` | Claude replies **ephemerally** — only the person who ran the command sees the question and the answer |
 
-Claude decides for itself when it needs more than the question. It gets five MCP
-tools for reading the current channel — history, a specific message, an attached
-file, the pins, and server members — and calls them only when the question needs
-them: "what did you mean by that?" triggers a lookback, "what is 17 × 23?" does
-not. Nothing is prefetched and no state is kept: the channel *is* the memory.
+The last five messages of the channel travel with every question, so ordinary
+follow-ups are answered without a single tool call. For anything further back,
+Claude reaches on its own: five MCP tools read the current channel — history, a
+specific message, an attached file, the pins, and server members — and it calls
+them only when the answer is not already in front of it. No state is kept
+anywhere: the channel *is* the memory.
 
-Reading that channel is the bot's entire capability. No file access, no shell,
-no web, and it cannot post anywhere you did not summon it.
+It can also search the web and fetch a page, so questions about current events,
+releases or a pasted link are answered rather than deflected. Beyond that it has
+nothing: no local files, no shell, and it cannot post anywhere you did not
+summon it.
 
 Responses are billed to your **Claude subscription** via a Claude Code OAuth token,
 not to a pay-per-token API key.
@@ -103,6 +106,8 @@ bundles (~277 MB) plus the Node base image.
 | `CLAUDE_TIMEOUT_MS` | no | `120000` | Per-request wall-clock limit |
 | `CLAUDE_MAX_CONCURRENT` | no | `3` | Concurrent Claude requests; extra messages queue |
 | `CLAUDE_MAX_TURNS` | no | `8` | Tool round-trips per question |
+| `RECENT_MESSAGES` | no | `5` | Recent messages sent with every question; `0` disables |
+| `WEB_TOOLS` | no | on | Set to `off` to remove web search and page fetch |
 | `HISTORY_DEFAULT_LIMIT` | no | `50` | Messages returned when Claude names no limit |
 | `HISTORY_MAX_LIMIT` | no | `200` | Hard cap per call, whatever Claude asks for |
 | `HISTORY_MAX_CHARS` | no | `6000` | Transcript budget; oldest lines dropped first |
@@ -136,8 +141,12 @@ src/register-commands.js One-off /claude registration
 
 ### The tools
 
-All five live in one in-process MCP server (`createSdkMcpServer`) — same process,
-no transport, nothing extra to run.
+Two built-in Claude Code tools, `WebSearch` and `WebFetch`, plus five Discord
+tools of our own. The Discord five live in one in-process MCP server
+(`createSdkMcpServer`) — same process, no transport, nothing extra to run.
+
+`Read`, `Write`, `Edit` and `Bash` stay switched off: the bot's input is
+untrusted channel text, and none of them serve a chat bot.
 
 ```
 fetch_history(from, to?, limit?)
@@ -167,6 +176,22 @@ who_is(query, limit?)            name fragment or user ID; servers only
 
 That trailing annotation is what makes attachments reachable — it hands Claude the
 filename and message ID to pass to `read_attachment`.
+
+**Web access**
+
+`WEB_TOOLS=off` removes both web tools; verified — the bot then reports it has no
+search tool rather than half-working. A fetched page is treated the same way as
+channel text: quotable source, never a source of instructions, since a web page
+is exactly the kind of thing that carries planted text.
+
+**The prefetch**
+
+Every question already carries the last `RECENT_MESSAGES` (default 5) messages in
+a `<recent_messages>` block, so "what did you just say?" costs one API call
+instead of a round-trip through `fetch_history`. Measured on the fake channel: a
+question answerable from those five made **1** call (the prefetch alone), while
+one needing older history made **3**. Set `RECENT_MESSAGES=0` to drop the seed
+and leave everything to the tools.
 
 **How far back it reaches**
 

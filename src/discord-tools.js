@@ -194,6 +194,39 @@ async function collect(channel, botId, fromMs, toMs, cap) {
   return out;
 }
 
+/**
+ * The last few messages, rendered like a tool transcript. Passed with every
+ * question so the common "what did you just say?" case costs no round-trip.
+ * Never throws: without history permission the answer proceeds without it.
+ */
+export async function recentTranscript(channel, botId, { limit = 5, before } = {}) {
+  if (limit <= 0) return "";
+
+  let batch;
+  try {
+    // Over-fetch: other bots and empty messages are dropped below.
+    batch = await channel.messages.fetch({
+      limit: Math.min(limit * 3, PAGE),
+      ...(before && { before }),
+    });
+  } catch (error) {
+    console.warn("recent messages unavailable:", error.message);
+    return "";
+  }
+
+  const entries = [];
+  for (const msg of [...batch.values()].sort((a, b) => b.createdTimestamp - a.createdTimestamp)) {
+    const entry = toEntry(msg, botId);
+    if (entry) entries.push(entry);
+    if (entries.length >= limit) break;
+  }
+  if (!entries.length) return "";
+
+  const lines = entries.reverse().map((e) => `[${iso(e.at)}] ${e.who}: ${e.body}`);
+  while (lines.length > 1 && lines.join("\n").length > MAX_CHARS) lines.shift();
+  return lines.join("\n");
+}
+
 // --- fetch_message ---------------------------------------------------------
 
 export async function fetchMessage(channel, botId, { reference, context = 0 }) {
