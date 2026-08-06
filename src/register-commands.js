@@ -1,6 +1,7 @@
 import "dotenv/config";
 import {
   ApplicationCommandOptionType,
+  InteractionContextType,
   REST,
   Routes,
 } from "discord.js";
@@ -16,6 +17,9 @@ const commands = [
   {
     name: "claude",
     description: "Ask Claude privately — only you see the question and the answer.",
+    // Server channels only. Discord itself then hides the command in DMs, so a
+    // DM interaction never reaches the bot to be refused.
+    contexts: [InteractionContextType.Guild],
     options: [
       {
         name: "prompt",

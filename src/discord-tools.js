@@ -2,6 +2,8 @@ import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { SnowflakeUtil } from "discord.js";
 import { z } from "zod";
 
+import { assertInChannel, isPermittedChannel } from "./channels.js";
+
 const SERVER = "discord";
 const names = [
   "fetch_history",
@@ -22,10 +24,19 @@ const TEXT_CHARS = Number(process.env.ATTACHMENT_MAX_CHARS ?? 8000);
 const PAGE = 100; // Discord's per-request maximum
 
 /**
- * In-process MCP server for reading one Discord channel. Everything is bound to
- * the channel the question arrived in, so no tool can reach another channel.
+ * In-process MCP server for reading one Discord channel.
+ *
+ * `channel` is captured here and is never a tool argument, so the channel is
+ * not something the model can name, guess or be argued into changing. Every
+ * fetch below then re-checks what came back with `assertInChannel`.
  */
 export function createDiscordServer(channel, botId) {
+  // Refuse outright rather than hand back a server whose tools all fail; the
+  // caller decides what to do with a channel the bot may not touch.
+  if (!isPermittedChannel(channel)) {
+    throw new Error(`Channel ${channel.id} is a DM or outside ALLOWED_CHANNEL_IDS.`);
+  }
+
   return createSdkMcpServer({
     name: SERVER,
     version: "1.0.0",
@@ -182,7 +193,7 @@ async function collect(channel, botId, fromMs, toMs, cap) {
       }
       if (msg.createdTimestamp > toMs) continue;
 
-      const entry = toEntry(msg, botId);
+      const entry = toEntry(msg, botId, channel);
       if (entry) out.push(entry);
       if (out.length >= cap) break;
     }
@@ -197,7 +208,10 @@ async function collect(channel, botId, fromMs, toMs, cap) {
 /**
  * The last few messages, rendered like a tool transcript. Passed with every
  * question so the common "what did you just say?" case costs no round-trip.
- * Never throws: without history permission the answer proceeds without it.
+ *
+ * A missing history permission is swallowed — the answer proceeds without the
+ * seed. A channel-scope violation is not: that means an invariant broke, and
+ * failing the request is better than answering from someone else's channel.
  */
 export async function recentTranscript(channel, botId, { limit = 5, before } = {}) {
   if (limit <= 0) return "";
@@ -216,7 +230,7 @@ export async function recentTranscript(channel, botId, { limit = 5, before } = {
 
   const entries = [];
   for (const msg of [...batch.values()].sort((a, b) => b.createdTimestamp - a.createdTimestamp)) {
-    const entry = toEntry(msg, botId);
+    const entry = toEntry(msg, botId, channel);
     if (entry) entries.push(entry);
     if (entries.length >= limit) break;
   }
@@ -238,8 +252,9 @@ export async function fetchMessage(channel, botId, { reference, context = 0 }) {
   } catch {
     throw new Error(`No message ${id} in this channel — it may be deleted or elsewhere.`);
   }
+  assertInChannel(target, channel);
 
-  const entries = [toEntry(target, botId)].filter(Boolean);
+  const entries = [toEntry(target, botId, channel)].filter(Boolean);
 
   if (context > 0) {
     const [before, after] = await Promise.all([
@@ -247,7 +262,8 @@ export async function fetchMessage(channel, botId, { reference, context = 0 }) {
       channel.messages.fetch({ limit: context, after: id }),
     ]);
     for (const msg of [...before.values(), ...after.values()]) {
-      const entry = toEntry(msg, botId);
+      assertInChannel(msg, channel);
+      const entry = toEntry(msg, botId, channel);
       if (entry) entries.push(entry);
     }
   }
@@ -284,6 +300,7 @@ const IMAGE_TYPES = /^image\/(png|jpeg|gif|webp)$/;
 export async function readAttachment(channel, { message_id, filename }) {
   const message = await channel.messages.fetch(message_id).catch(() => null);
   if (!message) throw new Error(`No message ${message_id} in this channel.`);
+  assertInChannel(message, channel);
 
   const files = [...message.attachments.values()];
   if (!files.length) throw new Error(`Message ${message_id} has no attachments.`);
@@ -358,7 +375,7 @@ export async function getPinned(channel, botId, { limit } = {}) {
   if (!messages.length) return "This channel has no pinned messages.";
 
   const entries = messages
-    .map((msg) => toEntry(msg, botId, { keepOtherBots: true }))
+    .map((msg) => toEntry(msg, botId, channel, { keepOtherBots: true }))
     .filter(Boolean)
     .sort((a, b) => a.at - b.at);
 
@@ -420,8 +437,15 @@ export async function whoIs(channel, { query, limit }) {
 
 // --- shared ----------------------------------------------------------------
 
-/** Turn a Discord message into a transcript entry, or null if it carries nothing. */
-function toEntry(msg, botId, { keepOtherBots = false } = {}) {
+/**
+ * Turn a Discord message into a transcript entry, or null if it carries nothing.
+ *
+ * Every tool that renders a message goes through here, which makes this the one
+ * place the channel check has to hold. A message from anywhere else throws
+ * rather than being quietly rendered.
+ */
+function toEntry(msg, botId, channel, { keepOtherBots = false } = {}) {
+  assertInChannel(msg, channel);
   if (msg.author.bot && msg.author.id !== botId && !keepOtherBots) return null;
 
   const parts = [];

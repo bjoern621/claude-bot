@@ -1,13 +1,8 @@
 import "dotenv/config";
-import {
-  Client,
-  Events,
-  GatewayIntentBits,
-  MessageFlags,
-  Partials,
-} from "discord.js";
+import { Client, Events, GatewayIntentBits, MessageFlags } from "discord.js";
 
 import { askClaude } from "./claude.js";
+import { isPermittedChannel } from "./channels.js";
 import { chunk } from "./chunk.js";
 import { claim, shouldAnnounce } from "./limits.js";
 import { resolveTrigger } from "./trigger.js";
@@ -25,14 +20,15 @@ if (!process.env.CLAUDE_CODE_OAUTH_TOKEN && !process.env.ANTHROPIC_API_KEY) {
   process.exit(1);
 }
 
+// No DirectMessages intent: Discord never delivers a DM to this process, so
+// the bot cannot answer one even if every check further in were removed. The
+// Channel partial went with it — it exists to hydrate DM channels.
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
-    GatewayIntentBits.DirectMessages,
   ],
-  partials: [Partials.Channel, Partials.Message],
 });
 
 /**
@@ -123,6 +119,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
   const prompt = interaction.options.getString("prompt", true);
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  // Discord already hides this command outside a server (see register-commands),
+  // and resolveTrigger never sees an interaction — so both rules are re-checked
+  // here rather than assumed.
+  if (!interaction.inGuild() || !isPermittedChannel(interaction.channel)) {
+    await interaction
+      .editReply("I only work in a server channel I have been enabled for.")
+      .catch(() => {});
+    return;
+  }
 
   // The refusal is ephemeral like the rest of the command, so it is not channel
   // noise and there is no reason to withhold it after the first one.

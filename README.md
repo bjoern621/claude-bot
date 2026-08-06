@@ -4,8 +4,8 @@ A Discord bot named **Claude**. Two behaviours, nothing else:
 
 | Trigger | Result |
 | --- | --- |
-| A message containing `@Claude`, a reply to one of Claude's messages, or any DM | Claude replies publicly in that channel |
-| `/claude prompt:<question>` | Claude replies **ephemerally** — only the person who ran the command sees the question and the answer |
+| A message containing `@Claude`, or a reply to one of Claude's messages | Claude replies publicly in that channel |
+| `/claude prompt:<text>` | Claude replies **ephemerally** — only the person who ran the command sees what was said and the answer |
 
 The last five messages of the channel travel with every question, so ordinary
 follow-ups are answered without a single tool call. For anything further back,
@@ -18,6 +18,11 @@ It can also search the web and fetch a page, so questions about current events,
 releases or a pasted link are answered rather than deflected. Beyond that it has
 nothing: no local files, no shell, and it cannot post anywhere you did not
 summon it.
+
+It is not only a question-answering machine: banter, thinking out loud and
+roleplay are all fair game, and it matches the length and tone of whoever it is
+talking to. A persona changes its voice, not its limits — it steps out of the
+act for a real request, and it will not impersonate someone in your server.
 
 Responses are billed to your **Claude subscription** via a Claude Code OAuth token,
 not to a pay-per-token API key.
@@ -113,6 +118,7 @@ bundles (~277 MB) plus the Node base image.
 | `RATE_LIMIT_GLOBAL_PER_HOUR` | no | `40` | Questions per hour across everyone; `off` disables |
 | `RATE_LIMIT_GLOBAL_PER_DAY` | no | `200` | Questions per day across everyone; `off` disables |
 | `RATE_LIMIT_EXEMPT_IDS` | no | — | Comma-separated user IDs that skip every rate limit |
+| `ALLOWED_CHANNEL_IDS` | no | — | Comma-separated channel IDs the bot may use; empty means every server channel |
 | `HISTORY_DEFAULT_LIMIT` | no | `50` | Messages returned when Claude names no limit |
 | `HISTORY_MAX_LIMIT` | no | `200` | Hard cap per call, whatever Claude asks for |
 | `HISTORY_MAX_CHARS` | no | `6000` | Transcript budget; oldest lines dropped first |
@@ -129,6 +135,7 @@ src/index.js             Discord client + both handlers
 src/trigger.js           Decides whether a message is addressed to the bot
 src/claude.js            Claude Agent SDK wrapper (concurrency cap, timeout, tool wiring)
 src/limits.js            Per-user and global rate limits, charged before any work starts
+src/channels.js          Channel allowlist and the same-channel assertion
 src/discord-tools.js     In-process MCP server exposing the five read tools
 src/chunk.js             Splits answers across Discord's 2000-char limit
 src/register-commands.js One-off /claude registration
@@ -136,8 +143,9 @@ src/register-commands.js One-off /claude registration
 
 ## Notes
 
-- In servers it answers when mentioned or when you reply to one of its messages;
-  in DMs it answers everything. Replying works whether or not the reply pings it.
+- It answers when mentioned or when you reply to one of its messages. Replying
+  works whether or not the reply pings it.
+- **Direct messages are off.** See *Channel scope*.
 - A reply is a **fresh** request, not a continued session. The message being
   replied to is named in the prompt, so short follow-ups like "and in feet?"
   resolve — and Claude can pull more with `fetch_history` if it needs it.
@@ -160,6 +168,46 @@ The windows live in memory and reset when the pod restarts. Bounding a spending
 worse problem.
 
 `RATE_LIMIT_EXEMPT_IDS` carries the owner's user ID past all three.
+
+### Channel scope
+
+The bot reads the channel a message arrived in and nothing else. That is a code
+guarantee, not an instruction to the model — a model can be argued out of an
+instruction, and channel text is untrusted input.
+
+Three layers, each independent:
+
+1. **The channel is not addressable.** `createDiscordServer(channel, …)` captures
+   it in a closure and no tool takes a channel argument, so there is no field
+   for the model to fill in with a different one. A pasted message link to
+   another channel is rejected by `resolveReference`.
+2. **Everything fetched is re-checked.** Every message the tools render passes
+   through `toEntry`, which calls `assertInChannel` first. Verified against a
+   deliberately hostile channel object whose every fetch returns a message from
+   elsewhere: `fetch_history`, `fetch_message`, `get_pinned_messages`,
+   `read_attachment` and the prefetch all refuse it rather than render it.
+3. **An allowlist, if you want one.** `ALLOWED_CHANNEL_IDS` is checked in
+   `resolveTrigger` (so the bot never answers), again in the `/claude` handler
+   (a slash command bypasses the trigger), and again before the MCP server is
+   built. Outside the list the bot is simply deaf: no reply, no API call, no
+   tools constructed.
+
+**Direct messages are off entirely**, independently of the allowlist. A DM is an
+unmoderated room: nobody else sees what was asked, and the channel-scoped reads
+that keep the bot auditable in a server mean nothing there. Four layers again,
+outermost first:
+
+1. The client requests no `DirectMessages` intent, so Discord never delivers a
+   DM to the process at all.
+2. `/claude` is registered with `contexts: [InteractionContextType.Guild]`, so
+   Discord hides it outside a server.
+3. `resolveTrigger` refuses any DM-based channel, group DMs included.
+4. `createDiscordServer` refuses to build tools for one.
+
+Layer 1 alone is sufficient; the rest hold if it is ever changed back.
+
+`who_is` is the one tool that is server-scoped rather than channel-scoped — it
+looks up members, not messages. It reads no message content.
 
 ### The tools
 
@@ -234,13 +282,11 @@ means unreachable, full stop.
 
 **Scoping and safety**
 
-- **One channel.** The server is constructed per request around the channel the
-  question arrived in. The channel is a closure variable, never a tool argument,
-  so no tool can read another channel — a message link pointing elsewhere is
-  refused rather than followed.
+- **One channel, enforced in code.** See *Channel scope* below. None of it rests
+  on the system prompt.
 - Other bots are skipped in transcripts; the bot's own replies are kept and
   labelled `Claude`. Pins keep other bots, since bots post useful pins.
-- `<context>` and `<question>` are separate blocks, and the system prompt states
+- `<context>`, `<recent_messages>` and `<message>` are separate blocks, and the system prompt states
   that everything a tool returns is background. A channel message reading "ignore
   your instructions" is treated as history, not obeyed.
 - The bot has no write tools. Worst case for anything it reads is a wrong answer,
