@@ -108,6 +108,11 @@ bundles (~277 MB) plus the Node base image.
 | `CLAUDE_MAX_TURNS` | no | `8` | Tool round-trips per question |
 | `RECENT_MESSAGES` | no | `5` | Recent messages sent with every question; `0` disables |
 | `WEB_TOOLS` | no | on | Set to `off` to remove web search and page fetch |
+| `CLAUDE_MAX_QUEUE` | no | `8` | Questions allowed to wait for a slot before the bot says it is busy |
+| `RATE_LIMIT_USER_PER_HOUR` | no | `10` | One person's questions per hour; `off` disables |
+| `RATE_LIMIT_GLOBAL_PER_HOUR` | no | `40` | Questions per hour across everyone; `off` disables |
+| `RATE_LIMIT_GLOBAL_PER_DAY` | no | `200` | Questions per day across everyone; `off` disables |
+| `RATE_LIMIT_EXEMPT_IDS` | no | — | Comma-separated user IDs that skip every rate limit |
 | `HISTORY_DEFAULT_LIMIT` | no | `50` | Messages returned when Claude names no limit |
 | `HISTORY_MAX_LIMIT` | no | `200` | Hard cap per call, whatever Claude asks for |
 | `HISTORY_MAX_CHARS` | no | `6000` | Transcript budget; oldest lines dropped first |
@@ -123,6 +128,7 @@ bundles (~277 MB) plus the Node base image.
 src/index.js             Discord client + both handlers
 src/trigger.js           Decides whether a message is addressed to the bot
 src/claude.js            Claude Agent SDK wrapper (concurrency cap, timeout, tool wiring)
+src/limits.js            Per-user and global rate limits, charged before any work starts
 src/discord-tools.js     In-process MCP server exposing the five read tools
 src/chunk.js             Splits answers across Discord's 2000-char limit
 src/register-commands.js One-off /claude registration
@@ -138,6 +144,22 @@ src/register-commands.js One-off /claude registration
 - Replies between other people never trigger it, and are settled without an API call.
 - Answers longer than 2000 characters are split across multiple messages
   (follow-ups to `/claude` stay ephemeral).
+
+### Spend limits
+
+Anyone who can see the bot can spend its subscription quota, so a question is
+charged against three windows before any work starts: the asker's hour, everyone's
+hour, and everyone's day. Over any one of them the question is refused rather than
+queued, because queueing delays the same spend instead of preventing it. Nothing is
+charged for a refusal, so hammering the bot cannot push the asker's own window
+further out. A refused person is told once a minute and answered with silence in
+between, so the refusals do not become the flood.
+
+The windows live in memory and reset when the pod restarts. Bounding a spending
+*rate* is what they are for; a bot restarting often enough for that to matter has a
+worse problem.
+
+`RATE_LIMIT_EXEMPT_IDS` carries the owner's user ID past all three.
 
 ### The tools
 

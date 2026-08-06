@@ -5,6 +5,7 @@ import { TOOL_NAMES, createDiscordServer, recentTranscript } from "./discord-too
 const MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-5";
 const TIMEOUT_MS = Number(process.env.CLAUDE_TIMEOUT_MS || 120_000);
 const MAX_CONCURRENT = Number(process.env.CLAUDE_MAX_CONCURRENT || 3);
+const MAX_QUEUE = Number(process.env.CLAUDE_MAX_QUEUE || 8);
 const MAX_TURNS = Number(process.env.CLAUDE_MAX_TURNS || 8);
 const RECENT_MESSAGES = Number(process.env.RECENT_MESSAGES ?? 5);
 // Set WEB_TOOLS=off to take the bot back off the internet.
@@ -55,6 +56,13 @@ function acquire() {
   if (active < MAX_CONCURRENT) {
     active++;
     return Promise.resolve();
+  }
+  // A queued request has no timeout on it: TIMEOUT_MS only starts once the
+  // query does. Left unbounded the queue would answer a question long after
+  // the channel moved on, with the asker watching a typing indicator the whole
+  // time. Refusing is the more honest answer.
+  if (waiting.length >= MAX_QUEUE) {
+    return Promise.reject(new Error("busy: request queue is full"));
   }
   return new Promise((resolve) => waiting.push(resolve));
 }

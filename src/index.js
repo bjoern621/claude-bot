@@ -9,6 +9,7 @@ import {
 
 import { askClaude } from "./claude.js";
 import { chunk } from "./chunk.js";
+import { claim, shouldAnnounce } from "./limits.js";
 import { resolveTrigger } from "./trigger.js";
 
 const TOKEN = process.env.DISCORD_TOKEN;
@@ -39,6 +40,9 @@ const client = new Client({
  * model, the auth state, or internals, so it stays in the logs.
  */
 function userFacing(error) {
+  if (/^busy:/.test(error.message)) {
+    return "Too many questions in flight right now. Try again in a minute.";
+  }
   return /did not respond within/.test(error.message)
     ? "That took too long. Try again, or ask for something smaller."
     : "Something went wrong — the details are in the bot's logs.";
@@ -82,6 +86,14 @@ client.on(Events.MessageCreate, async (message) => {
     return;
   }
 
+  // Charged before any work starts, so a flood costs Discord API calls and
+  // nothing else. A refused user is told once, then answered with silence.
+  const refusal = claim(message.author.id);
+  if (refusal) {
+    if (shouldAnnounce(message.author.id)) await message.reply(refusal).catch(() => {});
+    return;
+  }
+
   try {
     const answer = await withTyping(message.channel, () =>
       askClaude(prompt, {
@@ -111,6 +123,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
   const prompt = interaction.options.getString("prompt", true);
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  // The refusal is ephemeral like the rest of the command, so it is not channel
+  // noise and there is no reason to withhold it after the first one.
+  const refusal = claim(interaction.user.id);
+  if (refusal) {
+    await interaction.editReply(refusal).catch(() => {});
+    return;
+  }
 
   try {
     // The channel is already visible to whoever ran the command, so letting
