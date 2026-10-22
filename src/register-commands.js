@@ -27,6 +27,12 @@ const commands = [
         type: ApplicationCommandOptionType.String,
         required: true,
       },
+      {
+        name: "file",
+        description: "An image, PDF or text file to ask about",
+        type: ApplicationCommandOptionType.Attachment,
+        required: false,
+      },
     ],
   },
 ];

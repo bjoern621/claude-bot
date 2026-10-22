@@ -3,6 +3,7 @@ import { context as otelContext, SpanStatusCode } from "@opentelemetry/api";
 import { SnowflakeUtil } from "discord.js";
 import { z } from "zod";
 
+import { attachmentsOf, kindOf, loadAttachment, size } from "./attachments.js";
 import { assertInChannel, isPermittedChannel } from "./channels.js";
 import { instruments, tracer } from "./telemetry.js";
 
@@ -19,9 +20,6 @@ export const TOOL_NAMES = names.map((n) => `mcp__${SERVER}__${n}`);
 const DEFAULT_LIMIT = Number(process.env.HISTORY_DEFAULT_LIMIT ?? 50);
 const MAX_LIMIT = Number(process.env.HISTORY_MAX_LIMIT ?? 200);
 const MAX_CHARS = Number(process.env.HISTORY_MAX_CHARS ?? 6000);
-const TEXT_BYTES = Number(process.env.ATTACHMENT_MAX_TEXT_BYTES ?? 262_144); // 256 KiB
-const IMAGE_BYTES = Number(process.env.ATTACHMENT_MAX_IMAGE_BYTES ?? 4_194_304); // 4 MiB
-const TEXT_CHARS = Number(process.env.ATTACHMENT_MAX_CHARS ?? 8000);
 
 const PAGE = 100; // Discord's per-request maximum
 
@@ -97,10 +95,11 @@ export function createDiscordServer(channel, botId) {
 
       tool(
         "read_attachment",
-        "Read a file attached to a message in this channel — logs, stack traces, code, " +
-          "CSV, JSON, or an image. Transcript lines show the attachment names and the " +
+        "Read a file attached to an earlier message in this channel — logs, stack traces, " +
+          "code, CSV, JSON, or an image. Transcript lines show the attachment names and the " +
           "message ID to pass here. Text is returned inline; images are returned so you " +
-          "can look at them directly.",
+          "can look at them directly. Files on the message you are answering, and on the " +
+          "message it replies to, are already in front of you.",
         {
           message_id: z.string().describe("ID of the message carrying the attachment."),
           filename: z
@@ -297,17 +296,12 @@ function resolveReference(reference, channelId) {
 
 // --- read_attachment -------------------------------------------------------
 
-const TEXT_TYPES = /^(text\/|application\/(json|xml|x-yaml|yaml|javascript|sql|x-sh))/;
-const TEXT_EXTENSIONS =
-  /\.(txt|log|md|json|jsonl|csv|tsv|ya?ml|toml|ini|cfg|conf|xml|html?|css|diff|patch|sql|sh|bash|ps1|js|mjs|cjs|ts|tsx|jsx|py|rb|go|rs|java|kt|c|h|cpp|hpp|cs|php|swift|dockerfile|env\.example)$/i;
-const IMAGE_TYPES = /^image\/(png|jpeg|gif|webp)$/;
-
 export async function readAttachment(channel, { message_id, filename }) {
   const message = await channel.messages.fetch(message_id).catch(() => null);
   if (!message) throw new Error(`No message ${message_id} in this channel.`);
   assertInChannel(message, channel);
 
-  const files = [...message.attachments.values()];
+  const files = attachmentsOf(message);
   if (!files.length) throw new Error(`Message ${message_id} has no attachments.`);
 
   const file = filename
@@ -319,47 +313,27 @@ export async function readAttachment(channel, { message_id, filename }) {
     );
   }
 
-  const type = file.contentType?.split(";")[0]?.trim() ?? "";
-  const isImage = IMAGE_TYPES.test(type);
-  const isText = TEXT_TYPES.test(type) || TEXT_EXTENSIONS.test(file.name ?? "");
-
-  if (!isImage && !isText) {
+  // An MCP tool result carries text and images alone.
+  if (kindOf(file) === "pdf") {
     throw new Error(
-      `"${file.name}" is ${type || "an unknown type"}, which I cannot read. ` +
-        "I can read text-like files and PNG/JPEG/GIF/WebP images.",
+      `"${file.name}" is a PDF. I read PDFs only when they are attached to the question ` +
+        "or to the message it replies to.",
     );
   }
 
-  const cap = isImage ? IMAGE_BYTES : TEXT_BYTES;
-  if (file.size > cap) {
-    throw new Error(
-      `"${file.name}" is ${size(file.size)}, over the ${size(cap)} limit for this kind of file.`,
-    );
-  }
-
-  const response = await fetch(file.url);
-  if (!response.ok) throw new Error(`Download failed with HTTP ${response.status}.`);
-  const buffer = Buffer.from(await response.arrayBuffer());
-
-  if (isImage) {
+  const loaded = await loadAttachment(file);
+  if (loaded.kind === "image") {
     return {
       content: [
-        { type: "text", text: `Image "${file.name}" (${type}, ${size(file.size)}):` },
-        { type: "image", data: buffer.toString("base64"), mimeType: type },
+        { type: "text", text: `Image "${file.name}" (${size(file.size)}):` },
+        { type: "image", data: loaded.data, mimeType: loaded.mimeType },
       ],
     };
   }
 
-  let text = buffer.toString("utf8");
-  let note = "";
-  if (text.length > TEXT_CHARS) {
-    // Keep the tail: stack traces and logs put the interesting part last.
-    text = text.slice(-TEXT_CHARS);
-    note = ` — showing the last ${TEXT_CHARS} characters of ${buffer.length} bytes`;
-  }
-
+  const note = loaded.note ? `, ${loaded.note}` : "";
   return {
-    content: [{ type: "text", text: `"${file.name}"${note}:\n\n${text}` }],
+    content: [{ type: "text", text: `"${file.name}"${note}:\n\n${loaded.text}` }],
   };
 }
 
@@ -453,15 +427,16 @@ function toEntry(msg, botId, channel, { keepOtherBots = false } = {}) {
   assertInChannel(msg, channel);
   if (msg.author.bot && msg.author.id !== botId && !keepOtherBots) return null;
 
-  const parts = [];
-  if (msg.cleanContent?.trim()) parts.push(msg.cleanContent.trim());
+  const parts = describeBody(msg);
+  for (const snapshot of msg.messageSnapshots?.values() ?? []) {
+    const forwarded = describeBody(snapshot).join(" ");
+    if (forwarded) parts.push(`[forwarded: ${forwarded}]`);
+  }
 
   // Surface names + the message ID so read_attachment has something to go on.
-  if (msg.attachments.size) {
-    const names = [...msg.attachments.values()].map((a) => a.name).join(", ");
-    parts.push(`{attachments: ${names} | message id ${msg.id}}`);
-  } else if (msg.embeds.length) {
-    parts.push("[embed]");
+  const files = attachmentsOf(msg);
+  if (files.length) {
+    parts.push(`{attachments: ${files.map((a) => a.name).join(", ")} | message id ${msg.id}}`);
   }
 
   const body = parts.join(" ");
@@ -472,6 +447,27 @@ function toEntry(msg, botId, channel, { keepOtherBots = false } = {}) {
     who: msg.author.id === botId ? "Claude" : msg.author.displayName || msg.author.username,
     body,
   };
+}
+
+/** Text, embeds and stickers of a message or of a forwarded snapshot of one. */
+export function describeBody(msg) {
+  const parts = [];
+  const text = (msg.cleanContent ?? msg.content)?.trim();
+  if (text) parts.push(text);
+
+  for (const embed of msg.embeds ?? []) {
+    const fields = [embed.title, embed.description, embed.url].filter(Boolean);
+    parts.push(fields.length ? `[embed: ${excerpt(fields.join(" | "), 300)}]` : "[embed]");
+  }
+  for (const sticker of msg.stickers?.values() ?? []) {
+    parts.push(`[sticker: ${sticker.name}]`);
+  }
+  return parts;
+}
+
+function excerpt(text, max) {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max)}…` : flat;
 }
 
 /** Render entries oldest-first, trimming the oldest to fit the char budget. */
@@ -506,10 +502,6 @@ function parseTime(value, now) {
 
 function iso(ms) {
   return new Date(ms).toISOString().slice(0, 19).replace("T", " ") + "Z";
-}
-
-function size(bytes) {
-  return bytes < 1024 ? `${bytes} bytes` : `${Math.round(bytes / 1024)} KiB`;
 }
 
 /**

@@ -5,6 +5,7 @@ import { event, instruments, shutdownTelemetry, tracer } from "./telemetry.js";
 import "dotenv/config";
 import { Client, Events, GatewayIntentBits, MessageFlags } from "discord.js";
 
+import { attachmentsOf } from "./attachments.js";
 import { askClaude } from "./claude.js";
 import { isPermittedChannel } from "./channels.js";
 import { chunk } from "./chunk.js";
@@ -127,7 +128,7 @@ client.once(Events.ClientReady, (c) => {
 
 // --- Public: an @mention or a reply to the bot ------------------------------
 client.on(Events.MessageCreate, async (message) => {
-  const { respond, replyTarget } = await resolveTrigger(message, client.user);
+  const { respond, referenced } = await resolveTrigger(message, client.user);
   if (!respond) return;
 
   const prompt = message.content
@@ -135,7 +136,11 @@ client.on(Events.MessageCreate, async (message) => {
     .replaceAll(`<@!${client.user.id}>`, "")
     .trim();
 
-  if (!prompt) {
+  // A bare mention on a file, or in reply to someone else's message, asks about that.
+  const attachments = attachmentsOf(message);
+  const pointsAtSomething =
+    attachments.length > 0 || (referenced && referenced.author?.id !== client.user.id);
+  if (!prompt && !pointsAtSomething) {
     await message.reply("Mention me with a question, or use `/claude` to ask privately.");
     return;
   }
@@ -152,7 +157,8 @@ client.on(Events.MessageCreate, async (message) => {
           botId: client.user.id,
           author: message.author.displayName || message.author.username,
           where: describeChannel(message.channel),
-          replyingTo: replyTarget,
+          referenced,
+          attachments,
           // Seed from what came before this message — it is the question itself.
           recentBefore: message.id,
         }),
@@ -180,6 +186,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand() || interaction.commandName !== "claude") return;
 
   const prompt = interaction.options.getString("prompt", true);
+  const file = interaction.options.getAttachment("file");
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
   // Discord already hides this command outside a server (see register-commands),
@@ -205,6 +212,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         botId: client.user.id,
         author: interaction.user.displayName || interaction.user.username,
         where: interaction.channel ? describeChannel(interaction.channel) : undefined,
+        attachments: file ? [file] : [],
       }),
     post: async (answer) => {
       const parts = chunk(answer);

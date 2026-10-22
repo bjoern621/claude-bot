@@ -1,8 +1,9 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { SpanStatusCode } from "@opentelemetry/api";
 
+import { attachmentsOf, loadAttachment } from "./attachments.js";
 import { isPermittedChannel } from "./channels.js";
-import { TOOL_NAMES, createDiscordServer, recentTranscript } from "./discord-tools.js";
+import { TOOL_NAMES, createDiscordServer, describeBody, recentTranscript } from "./discord-tools.js";
 import { instruments, observe, tracer } from "./telemetry.js";
 
 const MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-5";
@@ -11,6 +12,9 @@ const MAX_CONCURRENT = Number(process.env.CLAUDE_MAX_CONCURRENT || 3);
 const MAX_QUEUE = Number(process.env.CLAUDE_MAX_QUEUE || 8);
 const MAX_TURNS = Number(process.env.CLAUDE_MAX_TURNS || 8);
 const RECENT_MESSAGES = Number(process.env.RECENT_MESSAGES ?? 5);
+// The API takes a request of 32 MB at most, base64 included.
+const INLINE_BYTES = Number(process.env.ATTACHMENT_MAX_INLINE_BYTES ?? 20_971_520); // 20 MiB
+const MAX_INLINE_FILES = 10;
 // Set WEB_TOOLS=off to take the bot back off the internet.
 const WEB_TOOLS = process.env.WEB_TOOLS === "off" ? [] : ["WebSearch", "WebFetch"];
 
@@ -39,6 +43,11 @@ const SYSTEM_PROMPT = [
   "not in <recent_messages> — older discussion, a pasted link, an attached log, who someone",
   "is. Prefer the narrowest call that could hold the answer and widen only if it does not;",
   "each call costs a round-trip, so skip them entirely when you already have enough.",
+  "",
+  "Files attached to the message, and to the message it replies to, come with it under",
+  "<attachments>: images and PDFs you see directly, text files inline. When someone asks",
+  "about 'this' and sends a file, the file is what they mean. A file listed there as not",
+  "readable is one you cannot see; say so and say why.",
   "",
   "Transcript lines labelled 'Claude' are your own earlier replies. A line ending in",
   "{attachments: ... | message id ...} tells you what to pass to read_attachment.",
@@ -126,10 +135,7 @@ function recordResult(span, message) {
  * on the channel it was asked in. `channel` scopes that tool — omit it and the
  * tool is not offered at all.
  */
-export async function askClaude(
-  prompt,
-  { channel, botId, author, where, replyingTo, recentBefore } = {},
-) {
+export async function askClaude(prompt, options = {}) {
   // Timed separately from the query. A slow answer and a queued one look
   // identical to the person waiting, and only one of them is the model's fault.
   const queuedAt = Date.now();
@@ -139,15 +145,94 @@ export async function askClaude(
   // Everything below runs inside the span so the Discord tools, which the SDK
   // invokes from its own event-loop turn, have a parent to attach to.
   return tracer.startActiveSpan("claude.query", (span) =>
-    runQuery(span, queueWaitMs, prompt, { channel, botId, author, where, replyingTo, recentBefore }),
+    runQuery(span, queueWaitMs, prompt, options),
   );
+}
+
+/**
+ * The context line naming the message replied to.
+ * A reply is still a fresh request; this says what it follows on from.
+ */
+function describeReference(referenced, botId) {
+  const body = excerpt(describeBody(referenced).join(" ")) || "(no text)";
+  if (referenced.author?.id === botId) {
+    return `This is a reply to your earlier message (id ${referenced.id}): "${body}"`;
+  }
+  const who = referenced.author?.displayName || referenced.author?.username || "someone";
+  return `This replies to a message by ${who} (id ${referenced.id}): "${body}"`;
+}
+
+/**
+ * Files on the question and on the message it replies to, as content blocks.
+ *
+ * A file that cannot be read becomes a line saying why,
+ * so the model can tell the asker instead of acting as if nothing was attached.
+ */
+async function attachmentBlocks(sources) {
+  const blocks = [];
+  let budget = INLINE_BYTES;
+  let count = 0;
+
+  for (const { files, origin } of sources) {
+    for (const file of files) {
+      const label = `"${file.name}", attached to ${origin}`;
+      if (count >= MAX_INLINE_FILES) {
+        blocks.push({ type: "text", text: `${label}: skipped, over ${MAX_INLINE_FILES} files.` });
+        continue;
+      }
+
+      let loaded;
+      try {
+        loaded = await loadAttachment(file);
+      } catch (error) {
+        blocks.push({ type: "text", text: `${label}: not readable. ${error.message}` });
+        continue;
+      }
+
+      const bytes = loaded.kind === "text" ? Buffer.byteLength(loaded.text) : loaded.data.length;
+      if (bytes > budget) {
+        blocks.push({ type: "text", text: `${label}: skipped, the files together are too large.` });
+        continue;
+      }
+      budget -= bytes;
+      count++;
+
+      if (loaded.kind === "text") {
+        const note = loaded.note ? ` (${loaded.note})` : "";
+        blocks.push({ type: "text", text: `File ${label}${note}:\n\n${loaded.text}` });
+      } else if (loaded.kind === "image") {
+        blocks.push({ type: "text", text: `Image ${label}:` });
+        blocks.push({
+          type: "image",
+          source: { type: "base64", media_type: loaded.mimeType, data: loaded.data },
+        });
+      } else {
+        blocks.push({ type: "text", text: `PDF ${label}:` });
+        blocks.push({
+          type: "document",
+          source: { type: "base64", media_type: "application/pdf", data: loaded.data },
+          title: file.name,
+        });
+      }
+    }
+  }
+  return blocks;
+}
+
+/** A single user turn, the shape the SDK takes when the prompt holds more than text. */
+async function* singleTurn(content) {
+  yield {
+    type: "user",
+    message: { role: "user", content },
+    parent_tool_use_id: null,
+  };
 }
 
 async function runQuery(
   span,
   queueWaitMs,
   prompt,
-  { channel, botId, author, where, replyingTo, recentBefore },
+  { channel, botId, author, where, referenced, attachments = [], recentBefore },
 ) {
   span.setAttribute("claude.model", MODEL);
   span.setAttribute("queue.wait_ms", queueWaitMs);
@@ -167,20 +252,31 @@ async function runQuery(
     `Current time: ${new Date().toISOString()}`,
     where && `Channel: ${where}`,
     author && `Asked by: ${author}`,
-    // A reply is still a fresh request; this only says what it follows on from.
-    replyingTo &&
-      `This is a reply to your earlier message (id ${replyingTo.id}): ` +
-        `"${excerpt(replyingTo.content)}"`,
+    referenced && describeReference(referenced, botId),
   ].filter(Boolean);
+
+  const files = await attachmentBlocks([
+    { files: attachments, origin: "the message" },
+    { files: referenced ? attachmentsOf(referenced) : [], origin: "the message it replies to" },
+  ]);
+  span.setAttribute("claude.attachments", files.filter((b) => b.type !== "text").length);
 
   const blocks = [
     `<context>\n${context.join("\n")}\n</context>`,
     recent && `<recent_messages>\n${recent}\n</recent_messages>`,
-    `<message>\n${prompt}\n</message>`,
+    `<message>\n${prompt || "(no text, only the attached files)"}\n</message>`,
   ].filter(Boolean);
+  const text = blocks.join("\n\n");
 
   const session = query({
-    prompt: blocks.join("\n\n"),
+    prompt: files.length
+      ? singleTurn([
+          { type: "text", text },
+          { type: "text", text: "<attachments>" },
+          ...files,
+          { type: "text", text: "</attachments>" },
+        ])
+      : text,
     options: {
       model: MODEL,
       systemPrompt: SYSTEM_PROMPT,

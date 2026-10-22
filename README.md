@@ -5,7 +5,7 @@ A Discord bot named **Claude**. Two behaviours, nothing else:
 | Trigger | Result |
 | --- | --- |
 | A message containing `@Claude`, or a reply to one of Claude's messages | Claude replies publicly in that channel |
-| `/claude prompt:<text>` | Claude replies **ephemerally** — only the person who ran the command sees what was said and the answer |
+| `/claude prompt:<text> file:<optional file>` | Claude replies **ephemerally** — only the person who ran the command sees what was said and the answer |
 
 The last five messages of the channel travel with every question, so ordinary
 follow-ups are answered without a single tool call. For anything further back,
@@ -128,6 +128,8 @@ bundles (~277 MB) plus the Node base image.
 | `HISTORY_MAX_CHARS` | no | `6000` | Transcript budget; oldest lines dropped first |
 | `ATTACHMENT_MAX_TEXT_BYTES` | no | `262144` | Largest text file downloaded |
 | `ATTACHMENT_MAX_IMAGE_BYTES` | no | `4194304` | Largest image downloaded |
+| `ATTACHMENT_MAX_PDF_BYTES` | no | `10485760` | Largest PDF downloaded |
+| `ATTACHMENT_MAX_INLINE_BYTES` | no | `20971520` | All files sent with one question together, base64 counted |
 | `ATTACHMENT_MAX_CHARS` | no | `8000` | Text kept from a file (the tail) |
 
 ¹ one of the two is required.
@@ -138,6 +140,7 @@ bundles (~277 MB) plus the Node base image.
 src/index.js             Discord client + both handlers
 src/trigger.js           Decides whether a message is addressed to the bot
 src/claude.js            Claude Agent SDK wrapper (concurrency cap, timeout, tool wiring)
+src/attachments.js       Downloads attachments as text, image or PDF for the model
 src/limits.js            Per-user and global rate limits, charged before any work starts
 src/telemetry.js         OpenTelemetry setup and the instruments the rest records to
 src/channels.js          Channel allowlist and the same-channel assertion
@@ -155,6 +158,12 @@ src/register-commands.js One-off /claude registration
   replied to is named in the prompt, so short follow-ups like "and in feet?"
   resolve — and Claude can pull more with `fetch_history` if it needs it.
 - Replies between other people never trigger it, and are settled without an API call.
+- Images and PDFs on the question reach the model as files it looks at. Text files arrive inline.
+  A mention in reply to someone else's message brings that message and its files along.
+  `@Claude` under a screenshot asks about the screenshot.
+  Images larger than 1568 px on a side come through Discord's media proxy scaled down.
+  A file of another kind (audio, video, an archive) is named to the model as unreadable.
+- Forwarded messages, embeds and stickers show up in transcripts as text.
 - Answers longer than 2000 characters are split across multiple messages
   (follow-ups to `/claude` stay ephemeral).
 
@@ -283,6 +292,7 @@ fetch_message(reference, context?)
 
 read_attachment(message_id, filename?)
   text files returned inline; PNG/JPEG/GIF/WebP returned as images to look at
+  PDFs refused: they reach the model attached to the question or to its reply target
 
 get_pinned_messages(limit?)      limit default 20, capped at 50
 who_is(query, limit?)            name fragment or user ID; servers only
