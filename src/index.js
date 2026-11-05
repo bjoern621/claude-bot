@@ -19,8 +19,8 @@ if (!TOKEN) {
 }
 if (!process.env.CLAUDE_CODE_OAUTH_TOKEN && !process.env.ANTHROPIC_API_KEY) {
   console.error(
-    "No Claude credentials. Set CLAUDE_CODE_OAUTH_TOKEN (run `claude setup-token`) " +
-      "to bill your Claude subscription, or ANTHROPIC_API_KEY for pay-per-token.",
+    "No Claude credentials. Set ANTHROPIC_API_KEY to bill per token, or " +
+      "CLAUDE_CODE_OAUTH_TOKEN (run `claude setup-token`) to use your Claude plan.",
   );
   process.exit(1);
 }

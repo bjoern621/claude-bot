@@ -24,8 +24,7 @@ roleplay are all fair game, and it matches the length and tone of whoever it is
 talking to. A persona changes its voice, not its limits — it steps out of the
 act for a real request, and it will not impersonate someone in your server.
 
-Responses are billed to your **Claude subscription** via a Claude Code OAuth token,
-not to a pay-per-token API key.
+Responses bill per token to the Claude Console organization that owns `ANTHROPIC_API_KEY`.
 
 ---
 
@@ -41,18 +40,15 @@ not to a pay-per-token API key.
    bot permissions `View Channels`, `Send Messages`, `Read Message History`.
    Open the generated URL and invite the bot to your server.
 
-## 2. Get a Claude subscription token
+## 2. Get a Claude API key
 
-On a machine where you are logged into Claude Code with your Pro/Max account:
+Create an API key in the [Claude Console](https://platform.claude.com) and copy it into `ANTHROPIC_API_KEY`.
 
-```bash
-claude setup-token
-```
+[Monthly API credits](https://support.claude.com/en/articles/17154008-monthly-api-credits-for-max-and-team-plans) on a Max, Ultra or Team plan cover the bot if the key comes from the Console organization linked to the plan.
+Once those credits run out, requests fail until the next monthly grant unless the organization has purchased credits or auto-reload.
 
-Copy the printed token into `CLAUDE_CODE_OAUTH_TOKEN`. It is long-lived — generate it
-once and put it in the deployment environment.
-
-> Prefer API billing instead? Set `ANTHROPIC_API_KEY` and leave the OAuth token unset.
+> Prefer your Claude plan's usage limits? Run `claude setup-token` on a machine logged into Claude Code and copy the token into `CLAUDE_CODE_OAUTH_TOKEN`.
+> `ANTHROPIC_API_KEY` must stay unset, since it wins when both are set.
 
 ## 3. Configure
 
@@ -60,7 +56,7 @@ once and put it in the deployment environment.
 cp .env.example .env
 ```
 
-Fill in `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, and `CLAUDE_CODE_OAUTH_TOKEN`.
+Fill in `DISCORD_TOKEN`, `DISCORD_CLIENT_ID` and `ANTHROPIC_API_KEY`.
 Set `DISCORD_GUILD_ID` to your server ID while testing — guild commands register
 instantly, global ones take up to an hour.
 
@@ -105,9 +101,9 @@ bundles (~277 MB) plus the Node base image.
 | `DISCORD_TOKEN` | yes | — | Bot token |
 | `DISCORD_CLIENT_ID` | for registration | — | Application ID |
 | `DISCORD_GUILD_ID` | no | — | Register `/claude` to one guild instead of globally |
-| `CLAUDE_CODE_OAUTH_TOKEN` | yes¹ | — | Subscription auth from `claude setup-token` |
-| `ANTHROPIC_API_KEY` | yes¹ | — | Alternative: pay-per-token API billing |
-| `CLAUDE_MODEL` | no | `claude-sonnet-5` | Set to `claude-opus-5` for harder questions, at more subscription quota |
+| `ANTHROPIC_API_KEY` | yes¹ | — | API key from the Claude Console, billed per token |
+| `CLAUDE_CODE_OAUTH_TOKEN` | yes¹ | — | Alternative: Claude plan auth from `claude setup-token` |
+| `CLAUDE_MODEL` | no | `claude-sonnet-5` | Set to `claude-opus-5` for harder questions, at a higher token price |
 | `CLAUDE_TIMEOUT_MS` | no | `120000` | Per-request wall-clock limit |
 | `CLAUDE_MAX_CONCURRENT` | no | `3` | Concurrent Claude requests; extra messages queue |
 | `CLAUDE_MAX_TURNS` | no | `8` | Tool round-trips per question |
@@ -169,7 +165,7 @@ src/register-commands.js One-off /claude registration
 
 ### Spend limits
 
-Anyone who can see the bot can spend its subscription quota, so a question is
+Anyone who can see the bot can spend its API credit, so a question is
 charged before any work starts. Over a limit it is refused rather than queued,
 because queueing delays the same spend instead of preventing it. Nothing is charged
 for a refusal, so hammering the bot cannot push the asker's own limit further out.

@@ -1,8 +1,8 @@
 /**
  * Admission control for paid work.
  *
- * Every accepted question spends subscription quota, and nothing in Discord
- * stops one person from asking a hundred times a minute. The concurrency gate in
+ * Every accepted question spends API credit. Nothing in Discord stops one
+ * person from asking a hundred times a minute. The concurrency gate in
  * claude.js is not a defence against that: it serialises the same spend rather
  * than refusing it. These limits refuse the request outright, before any of it
  * reaches Claude.
