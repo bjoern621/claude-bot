@@ -92,12 +92,17 @@ function retryIn(list, max, windowMs, now) {
   return freed === undefined ? 0 : Math.max(0, freed + windowMs - now);
 }
 
-function inWords(ms) {
-  const minutes = Math.ceil(ms / 60_000);
-  if (minutes <= 1) return "in about a minute";
-  if (minutes < 60) return `in about ${minutes} minutes`;
-  const hours = Math.ceil(minutes / 60);
-  return hours === 1 ? "in about an hour" : `in about ${hours} hours`;
+/**
+ * A Discord timestamp. The client renders it as "in 4 minutes" in the reader's
+ * locale and keeps counting down while the message stays on screen.
+ */
+function countdown(waitMs, now) {
+  return `<t:${Math.ceil((now + waitMs) / 1000)}:R>`;
+}
+
+/** Minutes between two refilled questions, for the refusal text. */
+function refillMinutes() {
+  return Math.round(HOUR_MS / PER_USER_HOUR / 60_000);
 }
 
 /**
@@ -167,7 +172,8 @@ export function claim(userId, where = {}) {
     return refuse(
       "global_day",
       wait,
-      `I have used up my question budget for today. Try again ${inWords(wait)}.`,
+      `Rate limited: everyone together has used all ${GLOBAL_DAY} questions of the last 24 hours. ` +
+        `The next question is available ${countdown(wait, now)}.`,
     );
   }
   if (countWithin(globalHits, HOUR_MS, now) >= GLOBAL_HOUR) {
@@ -176,7 +182,8 @@ export function claim(userId, where = {}) {
     return refuse(
       "global_hour",
       wait,
-      `I am answering as fast as my hourly budget allows. Try again ${inWords(wait)}.`,
+      `Rate limited: everyone together has used all ${GLOBAL_HOUR} questions of the last hour. ` +
+        `The next question is available ${countdown(wait, now)}.`,
     );
   }
 
@@ -194,7 +201,9 @@ export function claim(userId, where = {}) {
       return refuse(
         "user_bucket",
         wait,
-        `You are asking faster than I can keep up. Try again ${inWords(wait)}.`,
+        `Rate limited: you have used all ${PER_USER_BURST} of your questions. ` +
+          `You get one back every ${refillMinutes()} minutes. ` +
+          `Your next question is available ${countdown(wait, now)}.`,
       );
     }
 
