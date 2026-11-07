@@ -11,8 +11,10 @@ The last five messages of the channel travel with every question, so ordinary
 follow-ups are answered without a single tool call. For anything further back,
 Claude reaches on its own: five MCP tools read the current channel — history, a
 specific message, an attached file, the pins, and server members — and it calls
-them only when the answer is not already in front of it. No state is kept
-anywhere: the channel *is* the memory.
+them only when the answer is not already in front of it.
+
+With `MEMORY_DIR` set, it also keeps notes on each server and the people in it: how each person writes, what they like, the server's memes and in-jokes, who gets on with whom.
+See *Memory*.
 
 It can also search the web and fetch a page, so questions about current events,
 releases or a pasted link are answered rather than deflected. Beyond that it has
@@ -115,6 +117,9 @@ bundles (~277 MB) plus the Node base image.
 | `RATE_LIMIT_GLOBAL_PER_HOUR` | no | `40` | Questions per hour across everyone; `off` disables |
 | `RATE_LIMIT_GLOBAL_PER_DAY` | no | `200` | Questions per day across everyone; `off` disables |
 | `RATE_LIMIT_EXEMPT_IDS` | no | — | Comma-separated user IDs that skip every rate limit |
+| `MEMORY_DIR` | no | — | Directory for the notes on servers and people. Unset, memory is off |
+| `MEMORY_PERSON_MAX_CHARS` | no | `1500` | Longest note on one person |
+| `MEMORY_SERVER_MAX_CHARS` | no | `4000` | Longest note on one server |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | no | — | OTLP/HTTP collector. Unset, telemetry is off |
 | `OTEL_SERVICE_NAME` | no | `claude-bot` | Service name on every exported signal |
 | `OTEL_METRIC_EXPORT_INTERVAL` | no | `15000` | Milliseconds between metric exports |
@@ -138,9 +143,10 @@ src/trigger.js           Decides whether a message is addressed to the bot
 src/claude.js            Claude Agent SDK wrapper (concurrency cap, timeout, tool wiring)
 src/attachments.js       Downloads attachments as text, image or PDF for the model
 src/limits.js            Per-user and global rate limits, charged before any work starts
+src/memory.js            Notes on each server and its people, one JSON file per server
 src/telemetry.js         OpenTelemetry setup and the instruments the rest records to
 src/channels.js          Channel allowlist and the same-channel assertion
-src/discord-tools.js     In-process MCP server exposing the five read tools
+src/discord-tools.js     In-process MCP server exposing the read tools and the memory tools
 src/chunk.js             Splits answers across Discord's 2000-char limit
 src/register-commands.js One-off /claude registration
 ```
@@ -163,6 +169,27 @@ src/register-commands.js One-off /claude registration
 - Answers longer than 2000 characters are split across multiple messages
   (follow-ups to `/claude` stay ephemeral).
 
+### Memory
+
+Set `MEMORY_DIR` to keep notes between questions.
+Claude writes them itself through three tools and keeps one note per person and one per server:
+- a person: how they write, what they like and dislike, their humour, how they get on with others
+- a server: memes and in-jokes with where they came from, recurring topics, nicknames, relationships
+
+Every question carries the server note and the notes on the asker, on the author of the message replied to and on everyone in the recent messages.
+Claude reads anyone else's note on demand.
+A note gets replaced whole on each update, so it stays a condensed picture and never grows past its size limit.
+
+The bot answers "what do you know about me?" from the note and deletes it when asked to forget someone.
+Health, sexuality, religion, politics, addresses and real names stay out of the notes by instruction.
+Tell the server that the bot keeps notes on its members before you turn this on.
+
+Each server gets `<MEMORY_DIR>/<server id>.json`, readable and editable by hand while the bot is stopped.
+The bot caches the file after the first read, so an edit while it runs gets overwritten.
+One process must own the directory: a second replica would overwrite the first one's notes.
+
+Every update costs a tool round-trip, which adds tokens to the questions that change a note.
+
 ### Spend limits
 
 Anyone who can see the bot can spend its API credit, so a question is
@@ -171,6 +198,9 @@ because queueing delays the same spend instead of preventing it. Nothing is char
 for a refusal, so hammering the bot cannot push the asker's own limit further out.
 A refused person is told once a minute and answered with silence in between, so the
 refusals do not become the flood.
+The refusal names the limit and shows when the next question becomes available as a Discord timestamp, which counts down on screen:
+
+> Rate limited: you have used all 5 of your questions. You get one back every 6 minutes. Your next question is available in 4 minutes.
 
 **Globally** two sliding windows guard real spend — everyone's hour and everyone's
 day. These want a hard ceiling on any 60-minute stretch, with no burst allowance.
@@ -270,8 +300,9 @@ indicator the bot refreshes every eight seconds per in-flight question.
 ### The tools
 
 Two built-in Claude Code tools, `WebSearch` and `WebFetch`, plus five Discord
-tools of our own. The Discord five live in one in-process MCP server
-(`createSdkMcpServer`) — same process, no transport, nothing extra to run.
+tools of our own and three memory tools when `MEMORY_DIR` is set. Ours live in one
+in-process MCP server (`createSdkMcpServer`) — same process, no transport, nothing
+extra to run.
 
 `Read`, `Write`, `Edit` and `Bash` stay switched off: the bot's input is
 untrusted channel text, and none of them serve a chat bot.
@@ -292,6 +323,10 @@ read_attachment(message_id, filename?)
 
 get_pinned_messages(limit?)      limit default 20, capped at 50
 who_is(query, limit?)            name fragment or user ID; servers only
+
+read_person_notes(user_id)              the note on one member
+update_person_notes(user_id, notes)     replaces it whole; "" deletes it
+update_server_notes(notes)              replaces the server note whole
 ```
 
 `fetch_history` returns a transcript, oldest first:

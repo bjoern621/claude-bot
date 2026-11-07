@@ -5,15 +5,25 @@ import { z } from "zod";
 
 import { attachmentsOf, kindOf, loadAttachment, size } from "./attachments.js";
 import { assertInChannel, isPermittedChannel } from "./channels.js";
+import {
+  PERSON_NOTES_MAX_CHARS,
+  SERVER_NOTES_MAX_CHARS,
+  memoryEnabled,
+  personNotes,
+  rememberPerson,
+  rememberServer,
+} from "./memory.js";
 import { instruments, tracer } from "./telemetry.js";
 
 const SERVER = "discord";
+const MEMORY_TOOLS = ["read_person_notes", "update_person_notes", "update_server_notes"];
 const names = [
   "fetch_history",
   "fetch_message",
   "read_attachment",
   "get_pinned_messages",
   "who_is",
+  ...(memoryEnabled ? MEMORY_TOOLS : []),
 ];
 export const TOOL_NAMES = names.map((n) => `mcp__${SERVER}__${n}`);
 
@@ -150,8 +160,87 @@ export function createDiscordServer(channel, botId) {
         },
         traced(parent, "who_is", wrap((args) => whoIs(channel, args))),
       ),
+
+      ...(memoryEnabled ? memoryTools(channel, parent) : []),
     ],
   });
+}
+
+/**
+ * Tools over the notes in memory.js, scoped to the channel's server. Like the
+ * channel, the server never appears as an argument.
+ */
+function memoryTools(channel, parent) {
+  const guildId = channel.guild.id;
+
+  return [
+    tool(
+      "read_person_notes",
+      "Read your notes on one member of this server. The notes on the asker and on " +
+        "everyone in <recent_messages> are already under <memory>. Use this for someone " +
+        "else, for example when asked what you think of them. who_is finds the user ID.",
+      { user_id: z.string().describe("The member's user ID.") },
+      traced(
+        parent,
+        "read_person_notes",
+        wrap(async ({ user_id }) => {
+          const held = await personNotes(guildId, user_id);
+          return held ? `Notes on ${held.name} (id ${user_id}):\n${held.notes}` : `No notes on ${user_id}.`;
+        }),
+      ),
+    ),
+
+    tool(
+      "update_person_notes",
+      "Replace your notes on one member of this server. Pass the complete new text: the " +
+        "old notes merged with what you learned, condensed. Whatever you leave out is gone. " +
+        "An empty string deletes the notes.",
+      {
+        user_id: z.string().describe("The member's user ID, as listed under <memory>."),
+        notes: z.string().describe(`The full notes, at most ${PERSON_NOTES_MAX_CHARS} characters.`),
+      },
+      traced(
+        parent,
+        "update_person_notes",
+        wrap(async ({ user_id, notes }) => {
+          const member = await memberById(channel.guild, user_id);
+          await rememberPerson(guildId, member.id, member.displayName, notes);
+          return notes.trim() ? `Saved notes on ${member.displayName}.` : `Deleted notes on ${member.displayName}.`;
+        }),
+      ),
+    ),
+
+    tool(
+      "update_server_notes",
+      "Replace your notes on this server as a whole: running jokes, memes and where they " +
+        "came from, recurring topics, who gets along with whom. Pass the complete new text, " +
+        "merged and condensed. Whatever you leave out is gone.",
+      {
+        notes: z.string().describe(`The full notes, at most ${SERVER_NOTES_MAX_CHARS} characters.`),
+      },
+      traced(
+        parent,
+        "update_server_notes",
+        wrap(async ({ notes }) => {
+          await rememberServer(guildId, notes);
+          return "Saved the server notes.";
+        }),
+      ),
+    ),
+  ];
+}
+
+/** A member of `guild`, so notes never get filed under an ID that matches nobody. */
+async function memberById(guild, userId) {
+  if (!/^\d{17,20}$/.test(userId)) throw new Error(`"${userId}" is not a user ID.`);
+  try {
+    return await guild.members.fetch(userId);
+  } catch (error) {
+    if (error.status === 404 || error.code === 10007) {
+      throw new Error(`No member with ID ${userId} in this server.`);
+    }
+    throw new Error(`Member lookup failed: ${error.message}`);
+  }
 }
 
 // --- fetch_history ---------------------------------------------------------
@@ -213,12 +302,17 @@ async function collect(channel, botId, fromMs, toMs, cap) {
  * The last few messages, rendered like a tool transcript. Passed with every
  * question so the common "what did you just say?" case costs no round-trip.
  *
+ * Returns `{ text, authors }`: `authors` maps the user ID of everyone but the bot
+ * with a line in `text` to the name shown there. Both are empty when there is
+ * nothing to show.
+ *
  * A missing history permission is swallowed — the answer proceeds without the
  * seed. A channel-scope violation is not: that means an invariant broke, and
  * failing the request is better than answering from someone else's channel.
  */
 export async function recentTranscript(channel, botId, { limit = 5, before } = {}) {
-  if (limit <= 0) return "";
+  const none = { text: "", authors: new Map() };
+  if (limit <= 0) return none;
 
   let batch;
   try {
@@ -229,7 +323,7 @@ export async function recentTranscript(channel, botId, { limit = 5, before } = {
     });
   } catch (error) {
     console.warn("recent messages unavailable:", error.message);
-    return "";
+    return none;
   }
 
   const entries = [];
@@ -238,11 +332,18 @@ export async function recentTranscript(channel, botId, { limit = 5, before } = {
     if (entry) entries.push(entry);
     if (entries.length >= limit) break;
   }
-  if (!entries.length) return "";
+  if (!entries.length) return none;
 
-  const lines = entries.reverse().map((e) => `[${iso(e.at)}] ${e.who}: ${e.body}`);
-  while (lines.length > 1 && lines.join("\n").length > MAX_CHARS) lines.shift();
-  return lines.join("\n");
+  entries.reverse();
+  const lines = entries.map((e) => `[${iso(e.at)}] ${e.who}: ${e.body}`);
+  while (lines.length > 1 && lines.join("\n").length > MAX_CHARS) {
+    lines.shift();
+    entries.shift();
+  }
+
+  const authors = new Map();
+  for (const e of entries) if (e.authorId !== botId) authors.set(e.authorId, e.who);
+  return { text: lines.join("\n"), authors };
 }
 
 // --- fetch_message ---------------------------------------------------------
@@ -444,6 +545,7 @@ function toEntry(msg, botId, channel, { keepOtherBots = false } = {}) {
 
   return {
     at: msg.createdTimestamp,
+    authorId: msg.author.id,
     who: msg.author.id === botId ? "Claude" : msg.author.displayName || msg.author.username,
     body,
   };

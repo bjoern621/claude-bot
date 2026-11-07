@@ -5,4 +5,11 @@ services:
     container_name: claude-bot
     restart: unless-stopped
     env_file: .env
+    environment:
+      MEMORY_DIR: /data
+    volumes:
+      - memory:/data
     init: true
+
+volumes:
+  memory:

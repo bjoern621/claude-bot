@@ -21,8 +21,9 @@ RUN npm ci --omit=dev \
 
 COPY src ./src
 
-# The bundled CLI needs a writable HOME at runtime.
-RUN mkdir -p /home/node/workspace && chown -R node:node /home/node
+# The bundled CLI needs a writable HOME at runtime. /data holds the memory notes.
+# A named volume mounted there copies this ownership on first use.
+RUN mkdir -p /home/node/workspace /data && chown -R node:node /home/node /data
 
 ENV HOME=/home/node
 USER node
